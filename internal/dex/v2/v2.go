@@ -3,11 +3,12 @@ package v2
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
-	"golang.org/x/crypto/sha3"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 type Network string
@@ -22,6 +23,7 @@ type Config struct {
 	Network Network
 	Factory common.Address
 	Router  common.Address
+	WETH    common.Address
 	// Optional: more routers/factories per net in the future
 }
 
@@ -35,6 +37,12 @@ type Registry struct {
 		AddLiquidityETH [4]byte // 0xf305d719
 		AddLiquidity    [4]byte // 0xe8e33700
 	}
+}
+
+func (r *Registry) WETH() common.Address {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg.WETH
 }
 
 func NewRegistry(cfg Config) *Registry {
@@ -113,11 +121,7 @@ const (
 )
 
 func keccak(sig string) common.Hash {
-	h := sha3.NewLegacyKeccak256()
-	h.Write([]byte(sig))
-	var out [32]byte
-	h.Sum(out[:0])
-	return common.BytesToHash(out[:])
+	return crypto.Keccak256Hash([]byte(sig))
 }
 func fourBytes(hexStr string) [4]byte {
 	hexStr = strings.TrimPrefix(hexStr, "0x")
@@ -127,7 +131,14 @@ func fourBytes(hexStr string) [4]byte {
 	return a
 }
 
-// (Optional future) Allow dynamic updateds.
+func (cfg Config) Validate() error {
+	if (cfg.Factory == (common.Address{})) || (cfg.Router == (common.Address{})) || (cfg.WETH == (common.Address{})) {
+		return fmt.Errorf("v2.Config: factory/router/WETH must be set")
+	}
+	return nil
+}
+
+// (Optional future) Allow dynamic updates.
 func (r *Registry) Update(ctx context.Context, cfg Config) {
 	r.mu.Lock()
 	r.cfg = cfg

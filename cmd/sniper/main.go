@@ -1,24 +1,16 @@
-
 package main
 
 import (
 	"context"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
-	"time"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/spf13/viper"
 
 	"github.com/meltingclock/biteblock_v1/internal/config"
-	"github.com/meltingclock/biteblock_v1/internal/mempool"
 	"github.com/meltingclock/biteblock_v1/internal/telegram"
 )
 
+/*
 func loadConfig() (string, error) {
 	v := viper.New()
 	v.SetConfigName("config")
@@ -45,8 +37,9 @@ func loadConfig() (string, error) {
 	return wss, nil
 }
 
+
 func main() {
-	
+
 	// load YAML config (create if missing)
 	cfg, err := config.Load("config.yml")
 	if err != nil {
@@ -115,12 +108,32 @@ func main() {
 	w.Wait()
 	log.Println("bye")
 }
+*/
 
-// helpers
-// avoid nil pointer in To()
-func addrToHex(to *common.Address) string {
-	if to == nil {
-		return "<contract-creation>"
+func main() {
+	// Load config (creates config.yml if missing)
+	cfg, err := config.Load(config.DefaultPath)
+	if err != nil {
+		log.Fatalf("config load: %v", err)
 	}
-	return to.Hex()
+
+	// Optional: fail-fast if token missing (you can relax this if you want)
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config validation: %v", err)
+	}
+
+	// Ctrl-C / SIGTERM handling
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Telegram controller owns network presets + mempool + signals
+	ctrl, err := telegram.NewController(cfg, config.DefaultPath)
+	if err != nil {
+		log.Fatalf("telegram init: %v", err)
+	}
+
+	log.Println("telegram mode: listening for commands")
+	if err := ctrl.Start(ctx); err != nil {
+		log.Fatalf("controller error: %v", err)
+	}
 }

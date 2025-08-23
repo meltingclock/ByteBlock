@@ -138,6 +138,10 @@ export ME=<ANVIL_ACCOUNT0_ADDRESS>
 
 forge create --rpc-url $RPC_URL --broadcast --private-key $PK src/TestToken.sol:TestToken
 ```
+- Output: Deployer: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+          Deployed to: 0xA96aA8D425260B5514300a0b640313b4F727B0CE
+          Transaction hash: 0xd0c3fe1b3d2ae9d21ea595a4dae9991623efec6378fb5924b1cf9ecda441fe72  
+          
 - Save the token address
 - Approve router
 - Mint yourself tokens:

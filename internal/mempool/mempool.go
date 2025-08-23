@@ -11,8 +11,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
-	v2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
-	"github.com/meltingclock/biteblock_v1/internal/signals"
 )
 
 type TxHandler func(context.Context, *types.Transaction) error
@@ -25,12 +23,6 @@ type Watcher struct {
 
 	// internal
 	wg sync.WaitGroup
-
-	// --- NEW: long-lived client for logs + DEX signal plumbing ---
-	logEC       *ethclient.Client
-	cancelPairs context.CancelFunc
-	dexRouter   common.Address // optional: for IsRouter fast check
-	// liqAnalyzer *signals.LiquidityAnalyzer
 }
 
 func NewWatcher(wssURL string, onTx TxHandler) *Watcher {
@@ -48,69 +40,6 @@ func (w *Watcher) Start(ctx context.Context) error {
 	}
 	if w.Workers <= 0 {
 		w.Workers = 1
-	}
-
-	// --- NEW: long-lived client for logs/abi calls used by signals ---
-	dialCtx, cancel := context.WithTimeout(ctx, w.DialTimeout)
-	defer cancel()
-	rpc2, err := rpc.DialContext(dialCtx, w.WSSURL)
-	if err != nil {
-		return err
-	}
-	w.logEC = ethclient.NewClient(rpc2)
-
-	// --- NEW: DEX v2 config (put these in your config later) ---
-	// UniswapV2 (ETH mainnet) as example; replace per your target chain
-	factory := common.HexToAddress("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-	router := common.HexToAddress("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
-	w.dexRouter = router
-
-	// Start PairCrated registry subscription (in its own goroutine)
-	// NOTE: I'm keeping the actual PairRegistry & LiquidityAnalyzer
-	// inisde the OnTx wrapper below to minimize edits here. if you prefer,
-	// you can store them on Wather fields instead.
-	w.startDEXSignals(ctx, factory, router)
-
-	// keep original handler (may be nil)
-	orig := w.OnTx
-
-	// Build the analyzer objects once (require adding new packages)
-	dex := v2.NewRegistry(v2.Config{
-		Network: v2.Ethereum, // specify the network
-		Factory: factory,
-		Router:  w.dexRouter,
-	})
-	pairReg := signals.NewPairRegistry(dex, 48*time.Hour)
-	// Start PairCreated subscription on the long-lived client
-	prCtx, cancelPairs := context.WithCancel(ctx)
-	w.cancelPairs = cancelPairs
-	pairReg.Start(prCtx, w.logEC)
-
-	liq := signals.NewLiquidityAnalyzer(w.logEC, dex, pairReg)
-
-	// Decorate OnTx with liquidity detection
-	w.OnTx = func(ctx context.Context, tx *types.Transaction) error {
-		if tx == nil {
-			if orig != nil {
-				return orig(ctx, tx)
-			}
-			return nil
-		}
-		// fast address gate (only care if To() == router)
-		to := tx.To()
-		if to != nil && *to == w.dexRouter {
-			// analyze for addLiquidity* selectors and decode minimal params
-			sig, _ := liq.AnalyzePending(ctx, tx)
-			if sig != nil {
-				log.Printf("[signals] liquidity(pending) pair=%s token0=%s token1=%s from=%s kind=%d",
-					sig.Pair.Hex(), sig.Token0.Hex(), sig.Token1.Hex(), sig.From.Hex(), sig.Kind)
-				// TODO next: push `sig` into scanner/strategy/executor pipeline
-			}
-		}
-		if orig != nil {
-			return orig(ctx, tx)
-		}
-		return nil
 	}
 
 	// worker pool for processing
@@ -132,7 +61,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 							return
 						}
 						if w.OnTx != nil {
-							_ = w.OnTx(ctx, tx)
+							_ = w.OnTx(ctx, tx) // controller-provided callback
 						}
 					}
 				}
@@ -143,6 +72,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 		wg.Wait()
 	}()
 
+	// subscription loop
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
@@ -152,6 +82,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 	return nil
 }
 
+/*
 // --- NEW helper: start PairCreated subscription ---
 func (w *Watcher) startDEXSignals(ctx context.Context, factory, router common.Address) {
 	// build local registry/analyzer once used by the OnTx wrapper
@@ -169,6 +100,7 @@ func (w *Watcher) Stop() {
 		w.logEC.Close()
 	}
 }
+*/
 
 func (w *Watcher) Wait() {
 	w.wg.Wait()
@@ -215,14 +147,78 @@ func (w *Watcher) subscribeOnce(ctx context.Context, txCh chan<- *types.Transact
 	defer ethCl.Close()
 
 	// Subscribe to pending transaction hashes
-	hashes := make(chan common.Hash, 4096)
+	hashes := make(chan common.Hash, 8192) // was 4096; bump a bit
 	sub, err := rpcClient.EthSubscribe(ctx, hashes, "newPendingTransactions")
 	if err != nil {
 		return err
 	}
 	defer sub.Unsubscribe()
+
+	// NEW: fan-out fetchers to resolve hashes -> tx concurrently
+	fetchers := max(2, w.Workers/2)              // tune: start with 4–8
+	txOut := make(chan *types.Transaction, 2048) // stage between fetchers and workers
+
+	/*
+		// --- 1) Prefer FULL pending tx bodies (Geth / some nodes) ---
+		fullTxs := make(chan *types.Transaction, 4096)
+		sub, err := rpcClient.EthSubscribe(ctx, fullTxs, "newPendingTransactions", true)
+		if err == nil {
+			log.Printf("[mempool] subscribed to newPendingTransactions (full bodies)")
+			defer sub.Unsubscribe()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case err := <-sub.Err():
+					if err != nil {
+						return err
+					}
+					return nil
+				case tx := <-fullTxs:
+					if tx == nil {
+						continue
+					}
+					select {
+					case txCh <- tx:
+					default:
+						log.Printf("[mempool] txCh full (%d); dropping %s", len(txCh), tx.Hash().Hex())
+					}
+				}
+			}
+		}
+	*/
+
+	var fg sync.WaitGroup
+	fg.Add(fetchers)
+	for i := 0; i < fetchers; i++ {
+		go func() {
+			defer fg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case h := <-hashes:
+					tx, _, err := ethCl.TransactionByHash(ctx, h)
+					if err != nil {
+						continue
+					}
+					select {
+					case txOut <- tx:
+					default:
+						// drop if saturated (or use a non-blocking spillover)
+					}
+				}
+			}
+		}()
+	}
+
+	defer func() { // drain + join fetchers
+		close(txOut)
+		fg.Wait()
+	}()
 	log.Printf("[mempool] subscribed to newPendingTransactions")
 
+	// forward to your existing worker pool
 	for {
 		select {
 		case <-ctx.Done():
@@ -232,18 +228,11 @@ func (w *Watcher) subscribeOnce(ctx context.Context, txCh chan<- *types.Transact
 				return err
 			}
 			return nil
-		case h := <-hashes:
-			// fetch the full tx
-			tx, _, err := ethCl.TransactionByHash(ctx, h)
-			if err != nil {
-				// ignore transient not found / dropped
-				continue
-			}
+		case tx := <-txOut:
 			select {
 			case txCh <- tx:
 			default:
-				// channel full -> drop oldest behavior is not trivial; log and skip
-				log.Printf("[mempool] txCh full; dropping tx %s", h.Hex())
+				log.Printf("[mempool] txCh full (%d); dropping %s", len(txCh), tx.Hash().Hex())
 			}
 		}
 	}

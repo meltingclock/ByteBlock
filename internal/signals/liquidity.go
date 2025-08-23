@@ -41,6 +41,17 @@ type LiquidityAnalyzer struct {
 	pairs   *PairRegistry
 }
 
+func (k LiquidityKind) String() string {
+	switch k {
+	case LiqAddETH:
+		return "addLiquidityETH"
+	case LiqAddTokens:
+		return "addLiquidity"
+	default:
+		return "unknown"
+	}
+}
+
 func NewLiquidityAnalyzer(ec *ethclient.Client, dex *dexv2.Registry, pr *PairRegistry) *LiquidityAnalyzer {
 	rab, _ := abi.JSON(strings.NewReader(dexv2.RouterABI))
 	fab, _ := abi.JSON(strings.NewReader(dexv2.FactoryABI))
@@ -53,6 +64,11 @@ func (la *LiquidityAnalyzer) IsRouter(to *common.Address) bool {
 }
 
 func (la *LiquidityAnalyzer) AnalyzePending(ctx context.Context, tx *types.Transaction) (*LiquiditySignal, error) {
+	// fast router gate
+	if tx.To() == nil || !la.IsRouter(tx.To()) {
+		return nil, nil
+	}
+
 	// 1) quick 4-byte selector check
 	data := tx.Data()
 	if len(data) < 4 {
@@ -76,7 +92,8 @@ func (la *LiquidityAnalyzer) AnalyzePending(ctx context.Context, tx *types.Trans
 		}
 		token := args[0].(common.Address)
 		// Need token pair with WETH
-		weth := guessWETH(la.dex.Config().Network) // implement per-net
+		//weth := guessWETH(la.dex.Config().Network) // implement per-net
+		weth := la.dex.WETH()
 		pair, t0, t1, err := la.getPair(ctx, token, weth)
 		if err != nil {
 			return nil, nil
@@ -116,6 +133,16 @@ func (la *LiquidityAnalyzer) getPair(ctx context.Context, a, b common.Address) (
 	// First try local cache from PairRegistry
 	// (We don't know the pair addr if PairCreated not mined yet; but for most forks, getPair returns address(0) until mined)
 	// Fall back to on-chain getPair.
+	// Optional: try cache first (adjust method name to your PairRegistry)
+	if la.pairs != nil {
+		if p, ok := la.pairs.GetByTokens(a, b); ok { // <-- rename to your actual method
+			if strings.ToLower(a.Hex()) < strings.ToLower(b.Hex()) {
+				return p, a, b, nil
+			}
+			return p, b, a, nil
+		}
+	}
+
 	input, err := la.factory.Pack("getPair", a, b)
 	if err != nil {
 		return common.Address{}, common.Address{}, common.Address{}, err
@@ -149,6 +176,7 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
+/*
 // quick placeholder; replace with your configured WETH per net
 func guessWETH(n dexv2.Network) common.Address {
 	switch n {
@@ -162,3 +190,4 @@ func guessWETH(n dexv2.Network) common.Address {
 		return common.Address{} // unknown network, return zero address
 	}
 }
+*/

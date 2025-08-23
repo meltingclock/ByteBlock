@@ -24,6 +24,7 @@ type pairInfo struct {
 type PairRegistry struct {
 	mu     sync.RWMutex
 	pairs  map[common.Address]pairInfo
+	byTok  map[string]common.Address // NEW: tokenA|tokenB -> pair (canonical order)
 	ttl    time.Duration
 	dex    *dexv2.Registry
 	fab    abi.ABI
@@ -34,6 +35,7 @@ func NewPairRegistry(dex *dexv2.Registry, ttl time.Duration) *PairRegistry {
 	fab, _ := abi.JSON(strings.NewReader(dexv2.FactoryABI))
 	return &PairRegistry{
 		pairs: make(map[common.Address]pairInfo),
+		byTok: make(map[string]common.Address), // NEW: tokenA|tokenB -> pair (canonical order)
 		ttl:   ttl,
 		dex:   dex,
 		fab:   fab,
@@ -49,29 +51,84 @@ func (pr *PairRegistry) Start(ctx context.Context, client ethereum.LogFilterer) 
 		Topics:    [][]common.Hash{{pr.dex.TopicPairCreated()}},
 	}
 
-	log.Println("[signals] PairRegistry subscribing PairCreated")
-	ch := make(chan types.Log, 1024)
-	sub, err := client.SubscribeFilterLogs(ctx, q, ch)
-	if err != nil {
-		log.Printf("[signals] PairRegistry subscribe error: %v", err)
-		return
-	}
+	/*
+		log.Println("[signals] PairRegistry subscribing PairCreated")
+		ch := make(chan types.Log, 1024)
+		sub, err := client.SubscribeFilterLogs(ctx, q, ch)
+		if err != nil {
+			log.Printf("[signals] PairRegistry subscribe error: %v", err)
+			return
+		}
 
+
+			go func() {
+				ticker := time.NewTicker(time.Minute)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case err := <-sub.Err():
+						log.Printf("[signals] PairRegistry sub err: %v", err)
+						return
+					case lg := <-ch:
+						pr.handlePairCreated(lg)
+					case <-ticker.C:
+						pr.gc()
+
+					}
+				}
+			}()
+	*/
 	go func() {
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
+		backoff := time.Millisecond * 500
 		for {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Println("[signals] PairRegistry subscribing PairCreated")
+			ch := make(chan types.Log, 1024)
+			sub, err := client.SubscribeFilterLogs(ctx, q, ch)
+			if err != nil {
+				log.Printf("[signals] PairRegistry subscribe error: %v", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+					if backoff < time.Second*8 {
+						backoff *= 2
+					}
+					continue
+				}
+			}
+			// Active stream
+			backoff = time.Millisecond * 500
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			defer sub.Unsubscribe()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case err := <-sub.Err():
+					log.Printf("[signals] PairRegistry sub err: %v", err)
+					// break inner loop to resubscribe
+					goto RESUB
+				case lg := <-ch:
+					pr.handlePairCreated(lg)
+				case <-ticker.C:
+					pr.gc()
+				}
+			}
+		RESUB:
+			// loop to resubscribe with backoff
+			if backoff < time.Second*8 {
+				backoff *= 2
+			}
 			select {
 			case <-ctx.Done():
 				return
-			case err := <-sub.Err():
-				log.Printf("[signals] PairRegistry sub err: %v", err)
-				return
-			case lg := <-ch:
-				pr.handlePairCreated(lg)
-			case <-ticker.C:
-				pr.gc()
-
+			case <-time.After(backoff):
 			}
 		}
 	}()
@@ -112,9 +169,21 @@ func (pr *PairRegistry) handlePairCreated(lg types.Log) {
 	pi := pairInfo{Token0: token0, Token1: token1, CreatedAtBlock: lg.BlockNumber, SeenAt: time.Now()}
 	pr.mu.Lock()
 	pr.pairs[pair] = pi
+	// canonical key: token0 < token1 already holds for V2, but keep generic
+	k := tokKey(token0, token1)
+	pr.byTok[k] = pair
 	pr.mu.Unlock()
 	log.Printf("[signals] PairCreated pair=%s token0=%s token1=%s block=%d",
 		pair.Hex(), token0.Hex(), token1.Hex(), lg.BlockNumber)
+}
+
+func tokKey(a, b common.Address) string {
+	la := strings.ToLower(a.Hex())
+	lb := strings.ToLower(b.Hex())
+	if la < lb {
+		return la + "|" + lb
+	}
+	return lb + "|" + la
 }
 
 func (pr *PairRegistry) gc() {
@@ -123,9 +192,18 @@ func (pr *PairRegistry) gc() {
 	for p, info := range pr.pairs {
 		if info.SeenAt.Before(exp) {
 			delete(pr.pairs, p)
+			delete(pr.byTok, tokKey(info.Token0, info.Token1))
 		}
 	}
 	pr.mu.Unlock()
+}
+
+// GetByTokens returns a cached pair for (a,b) regardless of order.
+func (pr *PairRegistry) GetByTokens(a, b common.Address) (common.Address, bool) {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	p, ok := pr.byTok[tokKey(a, b)]
+	return p, ok
 }
 
 func (pr *PairRegistry) Get(pair common.Address) (pairInfo, bool) {
