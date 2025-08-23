@@ -29,6 +29,7 @@ type PairRegistry struct {
 	dex    *dexv2.Registry
 	fab    abi.ABI
 	cancel context.CancelFunc
+	client ethereum.LogFilterer
 }
 
 func NewPairRegistry(dex *dexv2.Registry, ttl time.Duration) *PairRegistry {
@@ -43,6 +44,7 @@ func NewPairRegistry(dex *dexv2.Registry, ttl time.Duration) *PairRegistry {
 }
 
 func (pr *PairRegistry) Start(ctx context.Context, client ethereum.LogFilterer) {
+	pr.client = client
 	ctx, cancel := context.WithCancel(ctx)
 	pr.cancel = cancel
 
@@ -104,15 +106,17 @@ func (pr *PairRegistry) Start(ctx context.Context, client ethereum.LogFilterer) 
 			// Active stream
 			backoff = time.Millisecond * 500
 			ticker := time.NewTicker(time.Minute)
-			defer ticker.Stop()
-			defer sub.Unsubscribe()
 			for {
 				select {
 				case <-ctx.Done():
+					defer ticker.Stop()
+					defer sub.Unsubscribe()
 					return
 				case err := <-sub.Err():
 					log.Printf("[signals] PairRegistry sub err: %v", err)
 					// break inner loop to resubscribe
+					defer ticker.Stop()
+					defer sub.Unsubscribe()
 					goto RESUB
 				case lg := <-ch:
 					pr.handlePairCreated(lg)
@@ -175,6 +179,26 @@ func (pr *PairRegistry) handlePairCreated(lg types.Log) {
 	pr.mu.Unlock()
 	log.Printf("[signals] PairCreated pair=%s token0=%s token1=%s block=%d",
 		pair.Hex(), token0.Hex(), token1.Hex(), lg.BlockNumber)
+
+	// BACKFILL: catch Mint that happened in the same tx/block.
+	if pr.client != nil {
+		go func(block uint64, p common.Address) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if evt, _ := BackfillMint(ctx, pr.client, p, block, block); evt != nil {
+				log.Printf("[liquidity][mined/backfill] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+					p.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), evt.Log.BlockNumber)
+				return
+			}
+			// small cushion
+			if evt, _ := BackfillMint(ctx, pr.client, p, block, block+1); evt != nil {
+				log.Printf("[liquidity][mined/backfill+] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+					p.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), evt.Log.BlockNumber)
+				return
+			}
+		}(lg.BlockNumber, pair)
+	}
 }
 
 func tokKey(a, b common.Address) string {
@@ -215,3 +239,14 @@ func (pr *PairRegistry) Get(pair common.Address) (pairInfo, bool) {
 
 // Helpful for status pages
 func (pr *PairRegistry) Size() int { pr.mu.RLock(); defer pr.mu.RUnlock(); return len(pr.pairs) }
+
+// Pairs returns a snapshot of known pair addresses.
+func (pr *PairRegistry) Pairs() []common.Address {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	out := make([]common.Address, 0, len(pr.pairs))
+	for p := range pr.pairs {
+		out = append(out, p)
+	}
+	return out
+}

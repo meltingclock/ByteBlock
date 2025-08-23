@@ -47,7 +47,7 @@ func (r *Registry) WETH() common.Address {
 
 func NewRegistry(cfg Config) *Registry {
 	r := &Registry{cfg: cfg}
-	r.topics.PairCreated = keccak("PairCreated(address,address,address,uint256)")
+	r.topics.PairCreated = Keccak("PairCreated(address,address,address,uint256)")
 
 	r.selectors.AddLiquidityETH = fourBytes("f305d719")
 	r.selectors.AddLiquidity = fourBytes("e8e33700")
@@ -120,7 +120,7 @@ const (
 	]`
 )
 
-func keccak(sig string) common.Hash {
+func Keccak(sig string) common.Hash {
 	return crypto.Keccak256Hash([]byte(sig))
 }
 func fourBytes(hexStr string) [4]byte {

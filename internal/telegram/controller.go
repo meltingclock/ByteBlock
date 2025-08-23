@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -17,6 +20,7 @@ import (
 	"github.com/meltingclock/biteblock_v1/internal/config"
 	v2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
 	"github.com/meltingclock/biteblock_v1/internal/mempool"
+	"github.com/meltingclock/biteblock_v1/internal/scanner"
 	"github.com/meltingclock/biteblock_v1/internal/signals"
 )
 
@@ -118,7 +122,18 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 	// Canonical PairCreated subscription + pending addLiquidity analyzer
 	pairReg := signals.NewPairRegistry(dex, 48*time.Hour)
 	pairReg.Start(wctx, ethCl)
+	// start the MintWatcher
+	startMintWatcher(wctx, ethCl, pairReg)
 	liq := signals.NewLiquidityAnalyzer(ethCl, dex, pairReg)
+
+	scan := scanner.New(ethCl, dex, scanner.Config{
+		RequireWethPair:   true,
+		MinEthLiquidity:   wei("0.3"),                // start conservative; tune later
+		MinTokenLiquidity: nil,                       // set when we want non-ETH pairs enforced
+		AllowCreators:     map[common.Address]bool{}, // empty = allow all
+		DenyCreators:      map[common.Address]bool{}, // can be filled later via telegram
+		Deadline:          250 * time.Millisecond,
+	})
 
 	// Mempool watcher (your existing pending-tx card + new Liquidity card)
 	c.watcher = mempool.NewWatcher(p.WSSURL, func(ctx context.Context, tx *types.Transaction) error {
@@ -136,8 +151,24 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 		}
 
 		// Liquidity detection vs preset router
-		if tx.To() != nil && strings.EqualFold(tx.To().Hex(), dex.Router().Hex()) {
+		if tx.To() != nil && *tx.To() == dex.Router() {
 			if sig, _ := liq.AnalyzePending(ctx, tx); sig != nil {
+				// ⬇️ fast safety scan first
+				rep, err := scan.Run(ctx, sig)
+				if err != nil {
+					log.Printf("[scanner][error]: %v", err)
+					return nil
+				}
+				if !rep.Pass {
+					log.Printf("[scan][reject] hash=%s reasons=%v fn=%s ethWei=%v a=%v b=%v",
+						sig.Hash.Hex(), rep.Reasons, rep.Function, rep.ETHInWei, rep.AmountA, rep.AmountB,
+					)
+					return nil
+				}
+				log.Printf("[scan][pass] hash=%s fn=%s ethWei=%v a=%v b=%v",
+					sig.Hash.Hex(), rep.Function, rep.ETHInWei, rep.AmountA, rep.AmountB,
+				)
+
 				// 👇 Console log (pending/liquidity)
 				log.Printf("[liquidity][pending] hash=%s kind=%s from=%s router=%s pair=%s t0=%s t1=%s nonce=%d val=%s",
 					sig.Hash.Hex(),
@@ -150,6 +181,8 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 					tx.Nonce(),
 					tx.Value().String(),
 				)
+
+				// NEW: run fast safety scan
 				c.reply(chatID, fmt.Sprintf(
 					"💧 *Liquidity detected*\n`%s`\nkind: `%s`\nfrom: `%s`\nrouter: `%s`\npair: `%s`\n"+
 						"token0: `%s`\ntoken1: `%s`\nnonce: %d\nvalue: %s wei",
@@ -163,6 +196,24 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 					tx.Nonce(),
 					tx.Value().String(),
 				))
+				// --- Receipt correlator (background; non-blocking) ---
+				go func(h common.Hash, pair common.Address) {
+					ctx2, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+
+					rcpt, err := ethCl.TransactionReceipt(ctx2, h)
+					if err != nil {
+						return // receipt not ready or RPC hiccup
+					}
+					if evt, ok := signals.FindMintInReceipt(rcpt, pair); ok {
+						log.Printf("[liquidity][mined/receipt] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+							pair.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), rcpt.BlockNumber)
+						c.reply(chatID, fmt.Sprintf(
+							"✅ *Liquidity mined*\npair: `%s`\nsender: `%s`\namount0: `%s`\namount1: `%s`\nblock: `%d`",
+							pair.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), rcpt.BlockNumber,
+						))
+					}
+				}(sig.Hash, sig.Pair)
 			}
 		}
 		return nil
@@ -175,6 +226,112 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 	c.running = True()
 	c.reply(chatID, fmt.Sprintf("🟢 *Sniper started* on *%s*\nWSS: `%s`", c.activeNet, p.WSSURL))
 	return nil
+}
+
+// Watches Mint(sender, amount0, amount1) on all known pairs to confirm mined liquidity.
+func startMintWatcher(ctx context.Context, ec *ethclient.Client, pr *signals.PairRegistry) {
+	const pairABI = `[
+	  {"anonymous":false,"inputs":[
+	    {"indexed":true,"name":"sender","type":"address"},
+	    {"indexed":false,"name":"amount0","type":"uint256"},
+	    {"indexed":false,"name":"amount1","type":"uint256"}],
+	   "name":"Mint","type":"event"}]`
+
+	ab, _ := abi.JSON(strings.NewReader(pairABI))
+	mintEvt := ab.Events["Mint"]
+	mintTopic := mintEvt.ID
+
+	go func() {
+		var (
+			sub     ethereum.Subscription
+			logsCh  chan types.Log
+			lastN   int
+			backoff = 500 * time.Millisecond
+		)
+		for {
+			if ctx.Err() != nil {
+				if sub != nil {
+					sub.Unsubscribe()
+				}
+				return
+			}
+
+			pairs := pr.Pairs()
+			if len(pairs) == 0 {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			// Resubscribe only when the set size grows (cheap heuristic).
+			if sub != nil && len(pairs) == lastN {
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			if sub != nil {
+				sub.Unsubscribe()
+			}
+
+			q := ethereum.FilterQuery{
+				Addresses: pairs,
+				Topics:    [][]common.Hash{{mintTopic}},
+			}
+			logsCh = make(chan types.Log, 1024)
+			s, err := ec.SubscribeFilterLogs(ctx, q, logsCh)
+			if err != nil {
+				log.Printf("[signals] Mint subscribe error: %v", err)
+				time.Sleep(backoff)
+				if backoff < 8*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+			sub = s
+			lastN = len(pairs)
+			backoff = 500 * time.Millisecond
+			log.Printf("[signals] Mint watcher subscribed to %d pairs", lastN)
+
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					sub.Unsubscribe()
+					return
+				case err := <-sub.Err():
+					log.Printf("[signals] Mint sub err: %v", err)
+					// break to outer loop and resubscribe
+					goto RESUB
+				case lg := <-logsCh:
+					// topic[1] = sender; data = amount0, amount1
+					sender := common.BytesToAddress(lg.Topics[1].Bytes()[12:])
+					vals, err := mintEvt.Inputs.NonIndexed().Unpack(lg.Data)
+					if err != nil || len(vals) < 2 {
+						log.Printf("[signals] Mint unpack err: %v", err)
+						continue
+					}
+					amount0 := vals[0].(*big.Int)
+					amount1 := vals[1].(*big.Int)
+					if false {
+						log.Printf("[liquidity][mined] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+							lg.Address.Hex(), sender.Hex(), amount0.String(), amount1.String(), lg.BlockNumber)
+					}
+				case <-ticker.C:
+					// If the number of pairs grewm resubscribe to include new addresses
+					if pr.Size() != lastN {
+						sub.Unsubscribe()
+						goto RESUB
+					}
+				}
+			}
+		RESUB:
+			// loop and resubscribe with (bounded) backoff
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
+			time.Sleep(backoff)
+		}
+	}()
 }
 
 func (c *Controller) Start(ctx context.Context) error {
@@ -296,3 +453,15 @@ func (c *Controller) Start(ctx context.Context) error {
 
 // helper so we can flip to true with a function (avoids shadow warning)
 func True() bool { return true }
+
+func wei(s string) *big.Int {
+	// naive decimal parser for small constants; or just use big.NewInt for hardcoded values
+	f, ok := new(big.Float).SetString(s)
+	if !ok {
+		return big.NewInt(0)
+	}
+	ethWei := new(big.Float).Mul(f, big.NewFloat(1e18))
+	out := new(big.Int)
+	ethWei.Int(out)
+	return out
+}

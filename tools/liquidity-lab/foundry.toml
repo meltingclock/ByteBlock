@@ -1,0 +1,9 @@
+[profile.default]
+src = "src"
+script = "script"
+out = "out"
+libs = ["lib"]
+remappings = ["forge-std/=lib/forge-std/src/"]
+# If your foundry is older, comment the next line:
+evm_version = "cancun"
+

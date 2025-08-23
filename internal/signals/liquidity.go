@@ -60,7 +60,7 @@ func NewLiquidityAnalyzer(ec *ethclient.Client, dex *dexv2.Registry, pr *PairReg
 }
 
 func (la *LiquidityAnalyzer) IsRouter(to *common.Address) bool {
-	return to != nil && strings.EqualFold(to.Hex(), la.dex.Router().Hex())
+	return to != nil && *to == la.dex.Router()
 }
 
 func (la *LiquidityAnalyzer) AnalyzePending(ctx context.Context, tx *types.Transaction) (*LiquiditySignal, error) {
