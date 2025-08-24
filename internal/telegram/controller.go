@@ -2,9 +2,11 @@ package telegram
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -68,8 +70,26 @@ type Controller struct {
 	watcher  *mempool.Watcher
 	cancelFn context.CancelFunc
 	running  bool
+	dex      *v2.Registry
+
+	// NEW: execution related
+	ethClient   *ethclient.Client
+	privateKey  *ecdsa.PrivateKey
+	walletAddr  common.Address
+	routerABI   abi.ABI
+	positions   map[common.Address]*Position // Track open positions
+	positionsMu sync.Mutex
 
 	activeNet string // NEW: "ethereum" | "bsc" | "base"
+
+}
+
+type Position struct {
+	Token      common.Address
+	Amount     *big.Int
+	EntryPrice *big.Int
+	EntryBlock uint64
+	EntryTime  time.Time
 }
 
 func NewController(cfg *config.Config, path string) (*Controller, error) {
@@ -410,6 +430,85 @@ func (c *Controller) Start(ctx context.Context) error {
 					c.running = false
 					c.reply(chatID, "🔴 Stopped.")
 				}()
+			case strings.HasPrefix(text, "/buy "):
+				parts := strings.Fields(text)
+				if len(parts) < 3 {
+					c.reply(chatID, "❌ Usage: /buy <token_address> <eth_amount>")
+					break
+				}
+
+				token := common.HexToAddress(parts[1])
+				ethAmount := parseEthAmount(parts[2]) // Parse "0.1" -> wei
+
+				// Safety check first
+				c.reply(chatID, "🔍 Running safety checks...")
+				checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
+				safety, err := checker.CheckToken(context.Background(), token)
+
+				if err != nil {
+					c.reply(chatID, fmt.Sprintf("❌ Safety check failed: %v", err))
+					break
+				}
+
+				// Display safety report
+				safetyEmoji := "🟢"
+				if safety.SafetyScore < 60 {
+					safetyEmoji = "🔴"
+				} else if safety.SafetyScore < 80 {
+					safetyEmoji = "🟡"
+				}
+
+				c.reply(chatID, fmt.Sprintf(
+					"%s *Safety Score: %d/100*\n"+
+						"Can Buy: %v\n"+
+						"Can Sell: %v\n"+
+						"Sell Tax: %.1f%%\n"+
+						"Has Owner: %v\n"+
+						"Honeypot: %v",
+					safetyEmoji, safety.SafetyScore,
+					safety.CanBuy, safety.CanSell,
+					safety.SellTax, safety.HasOwner,
+					safety.IsHoneypot,
+				))
+
+				if safety.IsHoneypot {
+					c.reply(chatID, "🚨 *HONEYPOT DETECTED!* Transaction aborted.")
+					break
+				}
+
+				if safety.SafetyScore < 60 {
+					c.reply(chatID, "⚠️ Token too risky (score < 60). Use /forcebuy to override.")
+					break
+				}
+
+				// Execute buy
+				c.reply(chatID, "💸 Executing buy...")
+				txHash, err := c.executeBuy(token, ethAmount)
+				if err != nil {
+					c.reply(chatID, fmt.Sprintf("❌ Buy failed: %v", err))
+					break
+				}
+
+				// Save position
+				c.positionsMu.Lock()
+				c.positions[token] = &Position{
+					Token:      token,
+					Amount:     ethAmount,
+					EntryPrice: ethAmount,
+					EntryTime:  time.Now(),
+				}
+				c.positionsMu.Unlock()
+
+				c.reply(chatID, fmt.Sprintf(
+					"✅ *Buy Successful!*\n"+
+						"Token: `%s`\n"+
+						"Amount: %s ETH\n"+
+						"Tx: `%s`\n"+
+						"Explorer: https://etherscan.io/tx/%s",
+					token.Hex(), formatEth(ethAmount),
+					txHash.Hex(), txHash.Hex(),
+				))
+
 			case strings.HasPrefix(text, "/status"):
 				state := "stopped"
 				if c.running {
@@ -514,4 +613,60 @@ func wei(s string) *big.Int {
 	out := new(big.Int)
 	ethWei.Int(out)
 	return out
+}
+
+func (c *Controller) executeBuy(token common.Address, ethAmount *big.Int) (common.Hash, error) {
+	nonce, err := c.ethClient.PendingNonceAt(context.Background(), c.walletAddr)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	// Build swap data
+	deadline := big.NewInt(time.Now().Add(3 * time.Minute).Unix())
+	path := []common.Address{c.dex.WETH(), token}
+
+	data, err := c.routerABI.Pack("swapExactETHForTokensSupportingFeeOnTransferTokens",
+		big.NewInt(0), // amountOutMin (0 = accept any amount, add slippage later)
+		path,
+		c.walletAddr,
+		deadline,
+	)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	// Get gas price with 20& boost for speed
+	gasPrice, err := c.ethClient.SuggestGasPrice(context.Background())
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(120))
+	gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
+
+	// Create Transaction
+	tx := types.NewTransaction(
+		nonce,
+		c.dex.Router(),
+		ethAmount,
+		300000, // gas limit
+		gasPrice,
+		data,
+	)
+
+	// Sign Transaction
+	chainID, _ := c.ethClient.ChainID(context.Background())
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	// Send Transaction
+	err = c.ethClient.SendTransaction(context.Background(), signedTx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	telemetry.Infof("[execute] buy sent: %s", signedTx.Hash().Hex())
+	return signedTx.Hash(), nil
 }
