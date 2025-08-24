@@ -1,3 +1,5 @@
+// Replace your internal/dex/v2/v2.go with this clean version
+
 package v2
 
 import (
@@ -14,32 +16,10 @@ import (
 
 type Network string
 
-// SigKind classifies well-known v2 router functions.
-type SigKind int
-
 const (
 	Ethereum Network = "ethereum"
 	Base     Network = "base"
 	BSC      Network = "bsc"
-)
-
-const (
-	SigUnknown SigKind = iota
-	SigAddLiquidityETH
-	SigAddLiquidity
-
-	// Swaps
-	SigSwapExactETHForTokens
-	SigSwapETHForExactTokens
-	SigSwapExactTokensForETH
-	SigSwapTokensForExactETH
-	SigSwapExactTokensForTokens
-	SigSwapTokensForExactTokens
-
-	// "SupportingFeeOnTransferTokens" variants
-	SigSwapExactETHForTokensSupportingFee
-	SigSwapExactTokensForETHSupportingFee
-	SigSwapExactTokensForTokensSupportingFee
 )
 
 type Config struct {
@@ -47,7 +27,6 @@ type Config struct {
 	Factory common.Address
 	Router  common.Address
 	WETH    common.Address
-	// Optional: more routers/factories per net in the future
 }
 
 type Registry struct {
@@ -60,23 +39,23 @@ type Registry struct {
 		AddLiquidityETH [4]byte
 		AddLiquidity    [4]byte
 
-		SwapExactETHForTokens                 [4]byte
-		SwapETHForExactTokens                 [4]byte
-		SwapExactTokensForETH                 [4]byte
-		SwapTokensForExactETH                 [4]byte
-		SwapExactTokensForTokens              [4]byte
-		SwapTokensForExactTokens              [4]byte
-		SwapExactETHForTokensSupportingFee    [4]byte
-		SwapExactTokensForETHSupportingFee    [4]byte
-		SwapExactTokensForTokensSupportingFee [4]byte
+		SwapExactETHForTokens                                 [4]byte
+		SwapETHForExactTokens                                 [4]byte
+		SwapExactTokensForETH                                 [4]byte
+		SwapTokensForExactETH                                 [4]byte
+		SwapExactTokensForTokens                              [4]byte
+		SwapTokensForExactTokens                              [4]byte
+		SwapExactETHForTokensSupportingFeeOnTransferTokens    [4]byte
+		SwapExactTokensForETHSupportingFeeOnTransferTokens    [4]byte
+		SwapExactTokensForTokensSupportingFeeOnTransferTokens [4]byte
 	}
 
-	// NEW: reverse lookup 4-byte -> meta
+	// Reverse lookup 4-byte -> meta (using the old system for compatibility)
 	sels map[[4]byte]SigMeta
 }
 
 type SigMeta struct {
-	Kind SigKind
+	Kind SigKind // Uses SigKind from selectors.go
 	Name string
 	Sel  [4]byte
 }
@@ -87,18 +66,76 @@ func (r *Registry) WETH() common.Address {
 	return r.cfg.WETH
 }
 
+// ClassifyTransaction - fast path for transaction classification
+func (r *Registry) ClassifyTransaction(data []byte) SigKind {
+	return Classify(data) // Use the optimized function from selectors.go
+}
+
+// IsLiquidityFunction checks if transaction is adding/removing liquidity
+func (r *Registry) IsLiquidityFunction(data []byte) bool {
+	kind := Classify(data)
+	switch kind {
+	case SigAddLiquidity, SigAddLiquidityETH,
+		SigRemoveLiquidity, SigRemoveLiquidityETH,
+		SigRemoveLiquidityETHSupportingFeeOnTransferTokens,
+		SigRemoveLiquidityWithPermit, SigRemoveLiquidityETHWithPermit,
+		SigRemoveLiquidityETHWithPermitSupportingFeeOnTransferTokens:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsSwapFunction checks if transaction is a token swap
+func (r *Registry) IsSwapFunction(data []byte) bool {
+	kind := Classify(data)
+	switch kind {
+	case SigSwapExactETHForTokens, SigSwapETHForExactTokens,
+		SigSwapExactTokensForETH, SigSwapTokensForExactETH,
+		SigSwapExactTokensForTokens, SigSwapTokensForExactTokens,
+		SigSwapExactETHForTokensSupportingFeeOnTransferTokens,
+		SigSwapExactTokensForETHSupportingFeeOnTransferTokens,
+		SigSwapExactTokensForTokensSupportingFeeOnTransferTokens:
+		return true
+	default:
+		return false
+	}
+}
+
+/*
+// ExtractSwapInfo - get swap details for analysis
+func (r *Registry) ExtractSwapInfo(data []byte) (*SwapParams, error) {
+	return DecodeSwapParams(data) // Use function from selectors.go
+}
+*/
+
+// ExtractLiquidityInfo - get liquidity details for analysis
+func (r *Registry) ExtractLiquidityInfo(data []byte) (interface{}, error) {
+	kind := Classify(data)
+	switch kind {
+	case SigAddLiquidityETH:
+		return DecodeAddLiquidityETH(data) // Use function from selectors.go
+	case SigAddLiquidity:
+		return DecodeAddLiquidity(data) // Use function from selectors.go
+	default:
+		return nil, fmt.Errorf("not a liquidity function")
+	}
+}
+
 func NewRegistry(cfg Config) *Registry {
 	r := &Registry{cfg: cfg}
 	r.sels = make(map[[4]byte]SigMeta)
 	r.topics.PairCreated = keccak("PairCreated(address,address,address,uint256)")
 
+	// Hardcoded selectors for backward compatibility
 	r.selectors.AddLiquidityETH = fourBytes("f305d719")
 	r.selectors.AddLiquidity = fourBytes("e8e33700")
-	// Parse router ABI once and map known methods -> IDs
+
+	// Parse router ABI and populate the legacy sels map
 	rab, _ := abi.JSON(strings.NewReader(RouterABI))
 	add := func(name string, kind SigKind, store *[4]byte) {
 		if m, ok := rab.Methods[name]; ok {
-			id := idTo4(any(m.ID)) // <-- normalize to [4]byte
+			id := idTo4(any(m.ID))
 			if store != nil {
 				*store = id
 			}
@@ -106,11 +143,9 @@ func NewRegistry(cfg Config) *Registry {
 		}
 	}
 
-	// Liquidity
+	// Populate legacy map (for backward compatibility)
 	add("addLiquidityETH", SigAddLiquidityETH, &r.selectors.AddLiquidityETH)
 	add("addLiquidity", SigAddLiquidity, &r.selectors.AddLiquidity)
-
-	// Swaps
 	add("swapExactETHForTokens", SigSwapExactETHForTokens, &r.selectors.SwapExactETHForTokens)
 	add("swapETHForExactTokens", SigSwapETHForExactTokens, &r.selectors.SwapETHForExactTokens)
 	add("swapExactTokensForETH", SigSwapExactTokensForETH, &r.selectors.SwapExactTokensForETH)
@@ -118,10 +153,10 @@ func NewRegistry(cfg Config) *Registry {
 	add("swapExactTokensForTokens", SigSwapExactTokensForTokens, &r.selectors.SwapExactTokensForTokens)
 	add("swapTokensForExactTokens", SigSwapTokensForExactTokens, &r.selectors.SwapTokensForExactTokens)
 
-	// SupportingFeeOnTransferTokens variants
-	add("swapExactETHForTokensSupportingFeeOnTransferTokens", SigSwapExactETHForTokensSupportingFee, &r.selectors.SwapExactETHForTokensSupportingFee)
-	add("swapExactTokensForETHSupportingFeeOnTransferTokens", SigSwapExactTokensForETHSupportingFee, &r.selectors.SwapExactTokensForETHSupportingFee)
-	add("swapExactTokensForTokensSupportingFeeOnTransferTokens", SigSwapExactTokensForTokensSupportingFee, &r.selectors.SwapExactTokensForTokensSupportingFee)
+	// Fee-on-transfer variants
+	add("swapExactETHForTokensSupportingFeeOnTransferTokens", SigSwapExactETHForTokensSupportingFeeOnTransferTokens, &r.selectors.SwapExactETHForTokensSupportingFeeOnTransferTokens)
+	add("swapExactTokensForETHSupportingFeeOnTransferTokens", SigSwapExactTokensForETHSupportingFeeOnTransferTokens, &r.selectors.SwapExactTokensForETHSupportingFeeOnTransferTokens)
+	add("swapExactTokensForTokensSupportingFeeOnTransferTokens", SigSwapExactTokensForTokensSupportingFeeOnTransferTokens, &r.selectors.SwapExactTokensForTokensSupportingFeeOnTransferTokens)
 
 	return r
 }
@@ -155,16 +190,28 @@ func (r *Registry) LookupSelectorFromData(data []byte) (SigMeta, bool) {
 	if len(data) < 4 {
 		return SigMeta{}, false
 	}
-	var s [4]byte
-	copy(s[:], data[:4])
-	return r.LookupSelector(s)
+
+	kind := Classify(data) // Use the fast classify function
+	if kind == SigUnknown {
+		return SigMeta{}, false
+	}
+
+	var selector [4]byte
+	copy(selector[:], data[:4])
+
+	// Create SigMeta from the classified kind
+	return SigMeta{
+		Kind: kind,
+		Name: KindToName(kind), // Use the function from selectors.go
+		Sel:  selector,
+	}, true
 }
 
 func (r *Registry) TopicPairCreated() common.Hash { return r.topics.PairCreated }
 func (r *Registry) SelAddLiquidityETH() [4]byte   { return r.selectors.AddLiquidityETH }
 func (r *Registry) SelAddLiquidity() [4]byte      { return r.selectors.AddLiquidity }
 
-// ABIs (minimal fragments)
+// ABIs (minimal fragments) - UNCHANGED
 const (
 	FactoryABI = `[
 		{"anonymous":false,"inputs":[
@@ -177,7 +224,6 @@ const (
 		 "name":"getPair","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"}
 	]`
 
-	// UniswapV2-style router: addLiquidity*, swap* (incl. SupportingFeeOnTransferTokens)
 	RouterABI = `[
 		{"inputs":[
 			{"internalType":"address","name":"token","type":"address"},
@@ -207,7 +253,6 @@ const (
 			{"internalType":"uint256","name":"liquidity","type":"uint256"}],
 		 "stateMutability":"nonpayable","type":"function"},
 
-		// Swaps (standard)
 		{"inputs":[
 			{"internalType":"uint256","name":"amountOutMin","type":"uint256"},
 			{"internalType":"address[]","name":"path","type":"address[]"},
@@ -255,7 +300,6 @@ const (
 		 "name":"swapTokensForExactTokens","outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
 		 "stateMutability":"nonpayable","type":"function"},
 
-		// Swaps (SupportingFeeOnTransferTokens variants)
 		{"inputs":[
 			{"internalType":"uint256","name":"amountOutMin","type":"uint256"},
 			{"internalType":"address[]","name":"path","type":"address[]"},
@@ -282,9 +326,11 @@ const (
 	]`
 )
 
+// Helper functions - UNCHANGED
 func keccak(sig string) common.Hash {
 	return crypto.Keccak256Hash([]byte(sig))
 }
+
 func fourBytes(hexStr string) [4]byte {
 	hexStr = strings.TrimPrefix(hexStr, "0x")
 	b, _ := hex.DecodeString(hexStr)
@@ -296,7 +342,6 @@ func fourBytes(hexStr string) [4]byte {
 func Keccak(sig string) common.Hash   { return keccak(sig) }
 func FourBytes(hexStr string) [4]byte { return fourBytes(hexStr) }
 
-// helper: make a [4]byte from either []byte or [4]byte
 func idTo4(id any) [4]byte {
 	var out [4]byte
 	switch v := id.(type) {
@@ -305,7 +350,7 @@ func idTo4(id any) [4]byte {
 	case []byte:
 		copy(out[:], v[:4])
 	default:
-		// Leave zeros; should't happen
+		// Leave zeros; shouldn't happen
 	}
 	return out
 }
@@ -317,7 +362,6 @@ func (cfg Config) Validate() error {
 	return nil
 }
 
-// (Optional future) Allow dynamic updates.
 func (r *Registry) Update(ctx context.Context, cfg Config) {
 	r.mu.Lock()
 	r.cfg = cfg

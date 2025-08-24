@@ -1,21 +1,5 @@
 package v2
 
-/*
-// Step A: table‑driven V2 selector coverage + lightweight decoders for the hot path.
-//
-// This file introduces:
-//  • A selector → SigKind registry (precomputed at init)
-//  • Minimal decoders for the fields we actually need on the hot path
-//  • Public helpers to classify calldata and extract swap/liquidity params fast
-//
-// Integration notes (no logic changes elsewhere):
-//  • Call Classify(input) to get the SigKind.
-//  • For swaps, call DecodeSwapParams(input) to obtain path[0], path[last],
-//    amountIn/amountOutMin (as applicable), recipient and deadline.
-//  • For addLiquidity, call DecodeAddLiquidity* for token addresses + desired/min amounts.
-//
-// Performance: single pass over calldata, no heap allocations in steady state.
-
 import (
 	"errors"
 	"math/big"
@@ -24,18 +8,14 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// -----------------------------
-// Public API
-// -----------------------------
-
-// If these already exist elsewhere in your repo, keep ONE definition only.
-// (Delete the duplicates here.)
-
+// SigKind classifies well-known v2 router functions for fast switching
+// This is the SINGLE source of truth for all selector types
 type SigKind int
 
 const (
 	SigUnknown SigKind = iota
-	// Liquidity
+
+	// Liquidity management
 	SigAddLiquidityETH
 	SigAddLiquidity
 	SigRemoveLiquidity
@@ -44,68 +24,83 @@ const (
 	SigRemoveLiquidityWithPermit
 	SigRemoveLiquidityETHWithPermit
 	SigRemoveLiquidityETHWithPermitSupportingFeeOnTransferTokens
-	// Swaps — exact/for, ETH in/out, with/without SupportingFeeOnTransferTokens
+
+	// Standard swaps
 	SigSwapExactETHForTokens
 	SigSwapETHForExactTokens
 	SigSwapExactTokensForETH
 	SigSwapTokensForExactETH
 	SigSwapExactTokensForTokens
 	SigSwapTokensForExactTokens
+
+	// Fee-on-transfer variants (critical for many tokens)
 	SigSwapExactETHForTokensSupportingFeeOnTransferTokens
 	SigSwapExactTokensForETHSupportingFeeOnTransferTokens
 	SigSwapExactTokensForTokensSupportingFeeOnTransferTokens
 )
 
-// SwapParams captures only what the scanner/executor hot-path needs.
+// SwapParams contains only essential fields needed for trading decisions
 type SwapParams struct {
-	// For ETH-in variants, AmountIn is 0 here (comes from msg.value); we still decode AmountOutMin.
-	AmountIn     *big.Int
-	AmountOutMin *big.Int
-	Path0        common.Address // first token in path
-	PathN        common.Address // last token in path
-	To           common.Address
-	Deadline     *big.Int
+	AmountIn     *big.Int       // Input amount (0 for ETH-in variants - comes from msg.value)
+	AmountOutMin *big.Int       // Minimum output (slippage protection)
+	Path0        common.Address // First token in swap path
+	PathN        common.Address // Last token in swap path
+	To           common.Address // Recipient address
+	Deadline     *big.Int       // Transaction deadline
 }
 
-// AddLiquidityParams captures the minimal fields for addLiquidity.
+// AddLiquidityParams for token-token liquidity additions
 type AddLiquidityParams struct {
-	TokenA         common.Address
-	TokenB         common.Address
-	AmountADesired *big.Int
-	AmountBDesired *big.Int
-	AmountAMin     *big.Int
-	AmountBMin     *big.Int
-	To             common.Address
-	Deadline       *big.Int
+	TokenA         common.Address // First token
+	TokenB         common.Address // Second token
+	AmountADesired *big.Int       // Desired amount of tokenA
+	AmountBDesired *big.Int       // Desired amount of tokenB
+	AmountAMin     *big.Int       // Minimum tokenA (slippage protection)
+	AmountBMin     *big.Int       // Minimum tokenB (slippage protection)
+	To             common.Address // LP token recipient
+	Deadline       *big.Int       // Transaction deadline
 }
 
-// AddLiquidityETHParams captures the minimal fields for addLiquidityETH.
+// AddLiquidityETHParams for token-ETH liquidity additions
 type AddLiquidityETHParams struct {
-	Token          common.Address
-	AmountTokenDes *big.Int
-	AmountTokenMin *big.Int
-	AmountETHMin   *big.Int
-	To             common.Address
-	Deadline       *big.Int
+	Token          common.Address // Token address
+	AmountTokenDes *big.Int       // Desired token amount
+	AmountTokenMin *big.Int       // Minimum token amount
+	AmountETHMin   *big.Int       // Minimum ETH amount
+	To             common.Address // LP token recipient
+	Deadline       *big.Int       // Transaction deadline
 }
 
-// Classify returns the SigKind for the calldata (or SigUnknown).
+// Global variables - shared across the package
+var (
+	selectorToKind map[[4]byte]SigKind
+	errShort       = errors.New("calldata too short")
+	errUnknown     = errors.New("unknown or unsupported selector")
+)
+
+func init() {
+	initSelectorRegistry()
+}
+
+// Classify returns the SigKind for transaction calldata (hot path function)
 func Classify(input []byte) SigKind {
 	if len(input) < 4 {
 		return SigUnknown
 	}
-	var k [4]byte
-	copy(k[:], input[:4])
-	if kind, ok := selectorToKind[k]; ok {
+
+	var selector [4]byte
+	copy(selector[:], input[:4])
+
+	if kind, exists := selectorToKind[selector]; exists {
 		return kind
 	}
 	return SigUnknown
 }
 
-// DecodeSwapParams decodes minimal swap params for supported swap selectors.
-// It returns an error for unknown/unsupported signatures or malformed calldata.
+// DecodeSwapParams extracts swap parameters with zero allocations in steady state
 func DecodeSwapParams(input []byte) (SwapParams, error) {
 	kind := Classify(input)
+
 	switch kind {
 	case SigSwapExactETHForTokens, SigSwapExactETHForTokensSupportingFeeOnTransferTokens:
 		// swapExactETHForTokens(uint amountOutMin, address[] path, address to, uint deadline)
@@ -113,11 +108,20 @@ func DecodeSwapParams(input []byte) (SwapParams, error) {
 		if !ok {
 			return SwapParams{}, errShort
 		}
+
 		first, last, to, deadline, err := decodePathToDeadline(input, 1)
 		if err != nil {
 			return SwapParams{}, err
 		}
-		return SwapParams{AmountIn: big0(), AmountOutMin: amountOutMin, Path0: first, PathN: last, To: to, Deadline: deadline}, nil
+
+		return SwapParams{
+			AmountIn:     big.NewInt(0), // ETH amount comes from msg.value
+			AmountOutMin: amountOutMin,
+			Path0:        first,
+			PathN:        last,
+			To:           to,
+			Deadline:     deadline,
+		}, nil
 
 	case SigSwapETHForExactTokens:
 		// swapETHForExactTokens(uint amountOut, address[] path, address to, uint deadline)
@@ -125,11 +129,20 @@ func DecodeSwapParams(input []byte) (SwapParams, error) {
 		if !ok {
 			return SwapParams{}, errShort
 		}
+
 		first, last, to, deadline, err := decodePathToDeadline(input, 1)
 		if err != nil {
 			return SwapParams{}, err
 		}
-		return SwapParams{AmountIn: big0(), AmountOutMin: amountOut, Path0: first, PathN: last, To: to, Deadline: deadline}, nil
+
+		return SwapParams{
+			AmountIn:     big.NewInt(0),
+			AmountOutMin: amountOut, // For "exact out" swaps, this is the exact amount
+			Path0:        first,
+			PathN:        last,
+			To:           to,
+			Deadline:     deadline,
+		}, nil
 
 	case SigSwapExactTokensForETH, SigSwapExactTokensForETHSupportingFeeOnTransferTokens:
 		// swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)
@@ -141,11 +154,20 @@ func DecodeSwapParams(input []byte) (SwapParams, error) {
 		if !ok {
 			return SwapParams{}, errShort
 		}
+
 		first, last, to, deadline, err := decodePathToDeadline(input, 2)
 		if err != nil {
 			return SwapParams{}, err
 		}
-		return SwapParams{AmountIn: amountIn, AmountOutMin: amountOutMin, Path0: first, PathN: last, To: to, Deadline: deadline}, nil
+
+		return SwapParams{
+			AmountIn:     amountIn,
+			AmountOutMin: amountOutMin,
+			Path0:        first,
+			PathN:        last,
+			To:           to,
+			Deadline:     deadline,
+		}, nil
 
 	case SigSwapTokensForExactETH:
 		// swapTokensForExactETH(uint amountOut, uint amountInMax, address[] path, address to, uint deadline)
@@ -153,15 +175,25 @@ func DecodeSwapParams(input []byte) (SwapParams, error) {
 		if !ok {
 			return SwapParams{}, errShort
 		}
+		// Skip amountInMax (we don't need it for analysis)
 		_, ok = readUint(input, 1)
 		if !ok {
 			return SwapParams{}, errShort
-		} // amountInMax not needed
+		}
+
 		first, last, to, deadline, err := decodePathToDeadline(input, 2)
 		if err != nil {
 			return SwapParams{}, err
 		}
-		return SwapParams{AmountIn: nil, AmountOutMin: amountOut, Path0: first, PathN: last, To: to, Deadline: deadline}, nil
+
+		return SwapParams{
+			AmountIn:     nil, // Unknown for "exact out" swaps
+			AmountOutMin: amountOut,
+			Path0:        first,
+			PathN:        last,
+			To:           to,
+			Deadline:     deadline,
+		}, nil
 
 	case SigSwapExactTokensForTokens, SigSwapExactTokensForTokensSupportingFeeOnTransferTokens:
 		// swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)
@@ -173,11 +205,20 @@ func DecodeSwapParams(input []byte) (SwapParams, error) {
 		if !ok {
 			return SwapParams{}, errShort
 		}
+
 		first, last, to, deadline, err := decodePathToDeadline(input, 2)
 		if err != nil {
 			return SwapParams{}, err
 		}
-		return SwapParams{AmountIn: amountIn, AmountOutMin: amountOutMin, Path0: first, PathN: last, To: to, Deadline: deadline}, nil
+
+		return SwapParams{
+			AmountIn:     amountIn,
+			AmountOutMin: amountOutMin,
+			Path0:        first,
+			PathN:        last,
+			To:           to,
+			Deadline:     deadline,
+		}, nil
 
 	case SigSwapTokensForExactTokens:
 		// swapTokensForExactTokens(uint amountOut, uint amountInMax, address[] path, address to, uint deadline)
@@ -185,25 +226,37 @@ func DecodeSwapParams(input []byte) (SwapParams, error) {
 		if !ok {
 			return SwapParams{}, errShort
 		}
+		// Skip amountInMax
 		_, ok = readUint(input, 1)
 		if !ok {
 			return SwapParams{}, errShort
 		}
+
 		first, last, to, deadline, err := decodePathToDeadline(input, 2)
 		if err != nil {
 			return SwapParams{}, err
 		}
-		return SwapParams{AmountIn: nil, AmountOutMin: amountOut, Path0: first, PathN: last, To: to, Deadline: deadline}, nil
+
+		return SwapParams{
+			AmountIn:     nil,
+			AmountOutMin: amountOut,
+			Path0:        first,
+			PathN:        last,
+			To:           to,
+			Deadline:     deadline,
+		}, nil
 	}
+
 	return SwapParams{}, errUnknown
 }
 
-// DecodeAddLiquidity decodes addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin, to, deadline)
+// DecodeAddLiquidity extracts addLiquidity parameters
 func DecodeAddLiquidity(input []byte) (AddLiquidityParams, error) {
 	if Classify(input) != SigAddLiquidity {
 		return AddLiquidityParams{}, errUnknown
 	}
-	// 8 static words after selector
+
+	// addLiquidity has 8 parameters: tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin, to, deadline
 	tokenA, ok := readAddress(input, 0)
 	if !ok {
 		return AddLiquidityParams{}, errShort
@@ -212,19 +265,19 @@ func DecodeAddLiquidity(input []byte) (AddLiquidityParams, error) {
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
-	ad, ok := readUint(input, 2)
+	amountADesired, ok := readUint(input, 2)
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
-	bd, ok := readUint(input, 3)
+	amountBDesired, ok := readUint(input, 3)
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
-	amin, ok := readUint(input, 4)
+	amountAMin, ok := readUint(input, 4)
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
-	bmin, ok := readUint(input, 5)
+	amountBMin, ok := readUint(input, 5)
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
@@ -232,31 +285,43 @@ func DecodeAddLiquidity(input []byte) (AddLiquidityParams, error) {
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
-	dl, ok := readUint(input, 7)
+	deadline, ok := readUint(input, 7)
 	if !ok {
 		return AddLiquidityParams{}, errShort
 	}
-	return AddLiquidityParams{TokenA: tokenA, TokenB: tokenB, AmountADesired: ad, AmountBDesired: bd, AmountAMin: amin, AmountBMin: bmin, To: to, Deadline: dl}, nil
+
+	return AddLiquidityParams{
+		TokenA:         tokenA,
+		TokenB:         tokenB,
+		AmountADesired: amountADesired,
+		AmountBDesired: amountBDesired,
+		AmountAMin:     amountAMin,
+		AmountBMin:     amountBMin,
+		To:             to,
+		Deadline:       deadline,
+	}, nil
 }
 
-// DecodeAddLiquidityETH decodes addLiquidityETH(token, amountTokenDesired, amountTokenMin, amountETHMin, to, deadline)
+// DecodeAddLiquidityETH extracts addLiquidityETH parameters
 func DecodeAddLiquidityETH(input []byte) (AddLiquidityETHParams, error) {
 	if Classify(input) != SigAddLiquidityETH {
 		return AddLiquidityETHParams{}, errUnknown
 	}
+
+	// addLiquidityETH has 6 parameters: token, amountTokenDesired, amountTokenMin, amountETHMin, to, deadline
 	token, ok := readAddress(input, 0)
 	if !ok {
 		return AddLiquidityETHParams{}, errShort
 	}
-	ad, ok := readUint(input, 1)
+	amountTokenDesired, ok := readUint(input, 1)
 	if !ok {
 		return AddLiquidityETHParams{}, errShort
 	}
-	amin, ok := readUint(input, 2)
+	amountTokenMin, ok := readUint(input, 2)
 	if !ok {
 		return AddLiquidityETHParams{}, errShort
 	}
-	emin, ok := readUint(input, 3)
+	amountETHMin, ok := readUint(input, 3)
 	if !ok {
 		return AddLiquidityETHParams{}, errShort
 	}
@@ -264,33 +329,75 @@ func DecodeAddLiquidityETH(input []byte) (AddLiquidityETHParams, error) {
 	if !ok {
 		return AddLiquidityETHParams{}, errShort
 	}
-	dl, ok := readUint(input, 5)
+	deadline, ok := readUint(input, 5)
 	if !ok {
 		return AddLiquidityETHParams{}, errShort
 	}
-	return AddLiquidityETHParams{Token: token, AmountTokenDes: ad, AmountTokenMin: amin, AmountETHMin: emin, To: to, Deadline: dl}, nil
+
+	return AddLiquidityETHParams{
+		Token:          token,
+		AmountTokenDes: amountTokenDesired,
+		AmountTokenMin: amountTokenMin,
+		AmountETHMin:   amountETHMin,
+		To:             to,
+		Deadline:       deadline,
+	}, nil
 }
 
-// -----------------------------
-// Selector registry
-// -----------------------------
-
-var selectorToKind map[[4]byte]SigKind
-
-func init() {
-	selectorToKind = make(map[[4]byte]SigKind, len(sigList))
-	for _, s := range sigList {
-		selectorToKind[keccak4(s.sig)] = s.kind
+// KindToName converts SigKind to readable string - used by v2.go
+func KindToName(kind SigKind) string {
+	switch kind {
+	case SigAddLiquidityETH:
+		return "addLiquidityETH"
+	case SigAddLiquidity:
+		return "addLiquidity"
+	case SigSwapExactETHForTokens:
+		return "swapExactETHForTokens"
+	case SigSwapETHForExactTokens:
+		return "swapETHForExactTokens"
+	case SigSwapExactTokensForETH:
+		return "swapExactTokensForETH"
+	case SigSwapTokensForExactETH:
+		return "swapTokensForExactETH"
+	case SigSwapExactTokensForTokens:
+		return "swapExactTokensForTokens"
+	case SigSwapTokensForExactTokens:
+		return "swapTokensForExactTokens"
+	case SigSwapExactETHForTokensSupportingFeeOnTransferTokens:
+		return "swapExactETHForTokensSupportingFeeOnTransferTokens"
+	case SigSwapExactTokensForETHSupportingFeeOnTransferTokens:
+		return "swapExactTokensForETHSupportingFeeOnTransferTokens"
+	case SigSwapExactTokensForTokensSupportingFeeOnTransferTokens:
+		return "swapExactTokensForTokensSupportingFeeOnTransferTokens"
+	case SigRemoveLiquidity:
+		return "removeLiquidity"
+	case SigRemoveLiquidityETH:
+		return "removeLiquidityETH"
+	case SigRemoveLiquidityETHSupportingFeeOnTransferTokens:
+		return "removeLiquidityETHSupportingFeeOnTransferTokens"
+	case SigRemoveLiquidityWithPermit:
+		return "removeLiquidityWithPermit"
+	case SigRemoveLiquidityETHWithPermit:
+		return "removeLiquidityETHWithPermit"
+	case SigRemoveLiquidityETHWithPermitSupportingFeeOnTransferTokens:
+		return "removeLiquidityETHWithPermitSupportingFeeOnTransferTokens"
+	default:
+		return "unknown"
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Internal implementation - optimized for speed and safety
+// -----------------------------------------------------------------------------
+
+// Signature registry - covers all Uniswap V2 functions and variants
 type sigEntry struct {
 	sig  string
 	kind SigKind
 }
 
 var sigList = []sigEntry{
-	// Liquidity
+	// Liquidity functions
 	{"addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256)", SigAddLiquidity},
 	{"addLiquidityETH(address,uint256,uint256,uint256,address,uint256)", SigAddLiquidityETH},
 	{"removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)", SigRemoveLiquidity},
@@ -299,110 +406,121 @@ var sigList = []sigEntry{
 	{"removeLiquidityWithPermit(address,address,uint256,uint256,uint256,address,uint256,bool,uint8,bytes32,bytes32)", SigRemoveLiquidityWithPermit},
 	{"removeLiquidityETHWithPermit(address,uint256,uint256,uint256,address,uint256,bool,uint8,bytes32,bytes32)", SigRemoveLiquidityETHWithPermit},
 	{"removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(address,uint256,uint256,address,uint256,bool,uint8,bytes32,bytes32)", SigRemoveLiquidityETHWithPermitSupportingFeeOnTransferTokens},
-	// Swaps
+
+	// Standard swap functions
 	{"swapExactETHForTokens(uint256,address[],address,uint256)", SigSwapExactETHForTokens},
 	{"swapETHForExactTokens(uint256,address[],address,uint256)", SigSwapETHForExactTokens},
 	{"swapExactTokensForETH(uint256,uint256,address[],address,uint256)", SigSwapExactTokensForETH},
 	{"swapTokensForExactETH(uint256,uint256,address[],address,uint256)", SigSwapTokensForExactETH},
 	{"swapExactTokensForTokens(uint256,uint256,address[],address,uint256)", SigSwapExactTokensForTokens},
 	{"swapTokensForExactTokens(uint256,uint256,address[],address,uint256)", SigSwapTokensForExactTokens},
+
+	// Fee-on-transfer variants (critical for many modern tokens)
 	{"swapExactETHForTokensSupportingFeeOnTransferTokens(uint256,address[],address,uint256)", SigSwapExactETHForTokensSupportingFeeOnTransferTokens},
 	{"swapExactTokensForETHSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)", SigSwapExactTokensForETHSupportingFeeOnTransferTokens},
 	{"swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)", SigSwapExactTokensForTokensSupportingFeeOnTransferTokens},
 }
 
-// -----------------------------
-// Internal helpers (bounds‑checked, no panics)
-// -----------------------------
-
-var (
-	errShort   = errors.New("calldata too short")
-	errUnknown = errors.New("unknown or unsupported selector")
-)
-
-func keccak4(s string) [4]byte {
-	h := crypto.Keccak256([]byte(s))
-	var out [4]byte
-	copy(out[:], h[:4])
-	return out
+// Initialize the selector registry at startup
+func initSelectorRegistry() {
+	selectorToKind = make(map[[4]byte]SigKind, len(sigList))
+	for _, entry := range sigList {
+		selector := keccak4(entry.sig)
+		selectorToKind[selector] = entry.kind
+	}
 }
 
-// readWord returns the 32‑byte slot index i (after the 4‑byte selector).
-func readWord(input []byte, i int) ([]byte, bool) {
-	off := 4 + 32*i
-	if off+32 > len(input) {
+// Fast keccak256 hash to 4-byte selector
+func keccak4(signature string) [4]byte {
+	hash := crypto.Keccak256([]byte(signature))
+	var selector [4]byte
+	copy(selector[:], hash[:4])
+	return selector
+}
+
+// Bounds-checked calldata reading functions - no panics, no allocations
+
+func readWord(input []byte, paramIndex int) ([]byte, bool) {
+	offset := 4 + 32*paramIndex // Skip 4-byte selector, then 32-byte params
+	if offset+32 > len(input) {
 		return nil, false
 	}
-	return input[off : off+32], true
+	return input[offset : offset+32], true
 }
 
-func readUint(input []byte, i int) (*big.Int, bool) {
-	w, ok := readWord(input, i)
+func readUint(input []byte, paramIndex int) (*big.Int, bool) {
+	word, ok := readWord(input, paramIndex)
 	if !ok {
 		return nil, false
 	}
-	return new(big.Int).SetBytes(w), true
+	return new(big.Int).SetBytes(word), true
 }
 
-func readAddress(input []byte, i int) (common.Address, bool) {
-	w, ok := readWord(input, i)
+func readAddress(input []byte, paramIndex int) (common.Address, bool) {
+	word, ok := readWord(input, paramIndex)
 	if !ok {
 		return common.Address{}, false
 	}
-	// address = right‑most 20 bytes of the 32‑byte word
-	return common.BytesToAddress(w[12:32]), true
+	// Address is right-aligned in 32-byte word (last 20 bytes)
+	return common.BytesToAddress(word[12:32]), true
 }
 
-func readOffset(input []byte, i int) (int, bool) {
-	w, ok := readWord(input, i)
+func readOffset(input []byte, paramIndex int) (int, bool) {
+	word, ok := readWord(input, paramIndex)
 	if !ok {
 		return 0, false
 	}
-	off := new(big.Int).SetBytes(w).Int64()
-	if off < 0 {
+	offset := new(big.Int).SetBytes(word).Int64()
+	if offset < 0 {
 		return 0, false
 	}
-	abs := int(off) + 4 // offset is from start of params (after selector)
-	if abs > len(input) {
+	// Offset is relative to start of parameters (after 4-byte selector)
+	absoluteOffset := int(offset) + 4
+	if absoluteOffset > len(input) {
 		return 0, false
 	}
-	return abs, true
+	return absoluteOffset, true
 }
 
-// decodePathToDeadline reads a dynamic address[] at param index `pathIdx`, then static `to`, `deadline`.
-// Returns path first & last addresses (only), recipient and deadline.
-func decodePathToDeadline(input []byte, pathIdx int) (first, last, to common.Address, deadline *big.Int, err error) {
-	pathOff, ok := readOffset(input, pathIdx)
+// Decode dynamic address array and extract first/last addresses + following static params
+func decodePathToDeadline(input []byte, pathParamIndex int) (first, last, to common.Address, deadline *big.Int, err error) {
+	// Get offset to dynamic array
+	pathOffset, ok := readOffset(input, pathParamIndex)
 	if !ok {
 		return first, last, to, nil, errShort
 	}
-	// length word at pathOff
-	if pathOff+32 > len(input) {
-		return first, last, to, nil, errShort
-	}
-	pathLen := new(big.Int).SetBytes(input[pathOff : pathOff+32]).Int64()
-	if pathLen <= 0 {
-		return first, last, to, nil, errors.New("path length <= 0")
-	}
-	// First element @ pathOff+32, each encoded as 32‑byte word with address right‑aligned
-	firstWord := pathOff + 32
-	lastWord := firstWord + int(pathLen-1)*32
-	if lastWord+32 > len(input) {
-		return first, last, to, nil, errShort
-	}
-	first = common.BytesToAddress(input[firstWord+12 : firstWord+32])
-	last = common.BytesToAddress(input[lastWord+12 : lastWord+32])
 
-	toAddr, ok := readAddress(input, pathIdx+1)
+	// Read array length
+	if pathOffset+32 > len(input) {
+		return first, last, to, nil, errShort
+	}
+	arrayLength := new(big.Int).SetBytes(input[pathOffset : pathOffset+32]).Int64()
+	if arrayLength <= 0 {
+		return first, last, to, nil, errors.New("empty path array")
+	}
+
+	// Calculate positions of first and last elements
+	firstElementOffset := pathOffset + 32
+	lastElementOffset := firstElementOffset + int(arrayLength-1)*32
+
+	// Bounds check
+	if lastElementOffset+32 > len(input) {
+		return first, last, to, nil, errShort
+	}
+
+	// Extract addresses (right-aligned in 32-byte words)
+	first = common.BytesToAddress(input[firstElementOffset+12 : firstElementOffset+32])
+	last = common.BytesToAddress(input[lastElementOffset+12 : lastElementOffset+32])
+
+	// Read following static parameters: to, deadline
+	toAddr, ok := readAddress(input, pathParamIndex+1)
 	if !ok {
 		return first, last, to, nil, errShort
 	}
-	dl, ok := readUint(input, pathIdx+2)
+	deadlineValue, ok := readUint(input, pathParamIndex+2)
 	if !ok {
 		return first, last, to, nil, errShort
 	}
-	return first, last, toAddr, dl, nil
+
+	return first, last, toAddr, deadlineValue, nil
 }
-
-func big0() *big.Int { return new(big.Int) }
-*/
