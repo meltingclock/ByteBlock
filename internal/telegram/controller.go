@@ -3,7 +3,6 @@ package telegram
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/big"
 	"strings"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"github.com/meltingclock/biteblock_v1/internal/mempool"
 	"github.com/meltingclock/biteblock_v1/internal/scanner"
 	"github.com/meltingclock/biteblock_v1/internal/signals"
+	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
 
 type NetPreset struct {
@@ -152,25 +152,32 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 
 		// Liquidity detection vs preset router
 		if tx.To() != nil && *tx.To() == dex.Router() {
+			if meta, ok := dex.LookupSelectorFromData(tx.Data()); !ok {
+				// Unknown function on router - skip fast
+				return nil
+			} else {
+				// log meta.Name/meta.Kind for visibility
+				telemetry.Debugf("[router] %s -> %s", tx.Hash(), meta.Name)
+			}
 			if sig, _ := liq.AnalyzePending(ctx, tx); sig != nil {
 				// ⬇️ fast safety scan first
 				rep, err := scan.Run(ctx, sig)
 				if err != nil {
-					log.Printf("[scanner][error]: %v", err)
+					telemetry.Warnf("[scanner][error]: %v", err)
 					return nil
 				}
 				if !rep.Pass {
-					log.Printf("[scan][reject] hash=%s reasons=%v fn=%s ethWei=%v a=%v b=%v",
+					telemetry.Debugf("[scan][reject] hash=%s reasons=%v fn=%s ethWei=%v a=%v b=%v",
 						sig.Hash.Hex(), rep.Reasons, rep.Function, rep.ETHInWei, rep.AmountA, rep.AmountB,
 					)
 					return nil
 				}
-				log.Printf("[scan][pass] hash=%s fn=%s ethWei=%v a=%v b=%v",
+				telemetry.Debugf("[scan][pass] hash=%s fn=%s ethWei=%v a=%v b=%v",
 					sig.Hash.Hex(), rep.Function, rep.ETHInWei, rep.AmountA, rep.AmountB,
 				)
 
 				// 👇 Console log (pending/liquidity)
-				log.Printf("[liquidity][pending] hash=%s kind=%s from=%s router=%s pair=%s t0=%s t1=%s nonce=%d val=%s",
+				telemetry.Debugf("[liquidity][pending] hash=%s kind=%s from=%s router=%s pair=%s t0=%s t1=%s nonce=%d val=%s",
 					sig.Hash.Hex(),
 					sig.Kind.String(),
 					sig.From.Hex(),
@@ -206,7 +213,7 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 						return // receipt not ready or RPC hiccup
 					}
 					if evt, ok := signals.FindMintInReceipt(rcpt, pair); ok {
-						log.Printf("[liquidity][mined/receipt] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+						telemetry.Debugf("[liquidity][mined/receipt] pair=%s sender=%s amount0=%s amount1=%s block=%d",
 							pair.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), rcpt.BlockNumber)
 						c.reply(chatID, fmt.Sprintf(
 							"✅ *Liquidity mined*\npair: `%s`\nsender: `%s`\namount0: `%s`\namount1: `%s`\nblock: `%d`",
@@ -278,7 +285,7 @@ func startMintWatcher(ctx context.Context, ec *ethclient.Client, pr *signals.Pai
 			logsCh = make(chan types.Log, 1024)
 			s, err := ec.SubscribeFilterLogs(ctx, q, logsCh)
 			if err != nil {
-				log.Printf("[signals] Mint subscribe error: %v", err)
+				telemetry.Warnf("[signals] Mint subscribe error: %v", err)
 				time.Sleep(backoff)
 				if backoff < 8*time.Second {
 					backoff *= 2
@@ -288,7 +295,7 @@ func startMintWatcher(ctx context.Context, ec *ethclient.Client, pr *signals.Pai
 			sub = s
 			lastN = len(pairs)
 			backoff = 500 * time.Millisecond
-			log.Printf("[signals] Mint watcher subscribed to %d pairs", lastN)
+			telemetry.Infof("[signals] Mint watcher subscribed to %d pairs", lastN)
 
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
@@ -299,7 +306,7 @@ func startMintWatcher(ctx context.Context, ec *ethclient.Client, pr *signals.Pai
 					sub.Unsubscribe()
 					return
 				case err := <-sub.Err():
-					log.Printf("[signals] Mint sub err: %v", err)
+					telemetry.Warnf("[signals] Mint sub err: %v", err)
 					// break to outer loop and resubscribe
 					goto RESUB
 				case lg := <-logsCh:
@@ -307,13 +314,13 @@ func startMintWatcher(ctx context.Context, ec *ethclient.Client, pr *signals.Pai
 					sender := common.BytesToAddress(lg.Topics[1].Bytes()[12:])
 					vals, err := mintEvt.Inputs.NonIndexed().Unpack(lg.Data)
 					if err != nil || len(vals) < 2 {
-						log.Printf("[signals] Mint unpack err: %v", err)
+						telemetry.Debugf("[signals] Mint unpack err: %v", err)
 						continue
 					}
 					amount0 := vals[0].(*big.Int)
 					amount1 := vals[1].(*big.Int)
 					if false {
-						log.Printf("[liquidity][mined] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+						telemetry.Infof("[liquidity][mined] pair=%s sender=%s amount0=%s amount1=%s block=%d",
 							lg.Address.Hex(), sender.Hex(), amount0.String(), amount1.String(), lg.BlockNumber)
 					}
 				case <-ticker.C:
@@ -367,6 +374,9 @@ func (c *Controller) Start(ctx context.Context) error {
 						"ℹ️ *Info*\n"+
 						"/status – Show current state & preset\n"+
 						"/show_config – Show non-secret config\n"+
+						"/debug on|off – enable/disable debug logs\n"+
+						"/trace on|off – enable/disable very noisy logs\n"+
+						"/tail [n] – show last n log lines (default 50)\n"+
 						"/whoami – Show your Telegram chat ID\n"+
 						"/set_chat <id> – restrict bot to a specific chat ID\n")
 			case strings.HasPrefix(text, "/net "):
@@ -430,6 +440,46 @@ func (c *Controller) Start(ctx context.Context) error {
 					"*Config*\nActive net: *%s*\nBOT_ADDRESS: `%s`\nPRIVATE_KEY: `%s`\nIDENTITY_KEY: %s\nCHAT_ID: `%d`",
 					c.activeNet, c.Cfg.BOT_ADDRESS, redactedPK, idStatus, c.Cfg.TELEGRAM_CHAT_ID,
 				))
+			case strings.HasPrefix(text, "/debug "):
+				arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/debug")))
+				on := arg == "on" || arg == "1" || arg == "true"
+				telemetry.EnableDebug(on)
+				c.reply(chatID, fmt.Sprintf("✅ debug: %v", on))
+			case strings.HasPrefix(text, "/trace "):
+				arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/trace")))
+				on := arg == "on" || arg == "1" || arg == "true"
+				telemetry.EnableTrace(on)
+				c.reply(chatID, fmt.Sprintf("✅ trace: %v", on))
+			case strings.HasPrefix(text, "/tail "):
+				n := 50
+				parts := strings.Fields(text)
+				if len(parts) > 1 {
+					fmt.Sscan(parts[1], &n)
+					if n <= 0 {
+						n = 50
+					}
+					if n > 500 {
+						n = 500
+					} // avoid flooding telegram
+				}
+				lines := telemetry.Tail(n)
+				if len(lines) == 0 {
+					c.reply(chatID, "ℹ️ log buffer empty")
+					break
+				}
+				// Telegram messages max ~4096 chars; chunk if needed
+				var buf strings.Builder
+				for _, ln := range lines {
+					if buf.Len()+len(ln)+1 > 3500 { // conservative
+						c.reply(chatID, "```\n"+buf.String()+"\n```")
+						buf.Reset()
+					}
+					buf.WriteString(ln)
+					buf.WriteByte('\n')
+				}
+				if buf.Len() > 0 {
+					c.reply(chatID, "```\n"+buf.String()+"\n```")
+				}
 			case strings.HasPrefix(text, "/whoami"):
 				c.reply(chatID, fmt.Sprintf("Your chat ID: `%d`", chatID))
 			case strings.HasPrefix(text, "/set_chat "):

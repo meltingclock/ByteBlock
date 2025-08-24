@@ -2,7 +2,6 @@ package signals
 
 import (
 	"context"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 
 	dexv2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
+	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
 
 type pairInfo struct {
@@ -88,11 +88,11 @@ func (pr *PairRegistry) Start(ctx context.Context, client ethereum.LogFilterer) 
 			if ctx.Err() != nil {
 				return
 			}
-			log.Println("[signals] PairRegistry subscribing PairCreated")
+			telemetry.Infof("[signals] PairRegistry subscribing PairCreated")
 			ch := make(chan types.Log, 1024)
 			sub, err := client.SubscribeFilterLogs(ctx, q, ch)
 			if err != nil {
-				log.Printf("[signals] PairRegistry subscribe error: %v", err)
+				telemetry.Warnf("[signals] PairRegistry subscribe error: %v", err)
 				select {
 				case <-ctx.Done():
 					return
@@ -113,7 +113,7 @@ func (pr *PairRegistry) Start(ctx context.Context, client ethereum.LogFilterer) 
 					defer sub.Unsubscribe()
 					return
 				case err := <-sub.Err():
-					log.Printf("[signals] PairRegistry sub err: %v", err)
+					telemetry.Warnf("[signals] PairRegistry sub err: %v", err)
 					// break inner loop to resubscribe
 					defer ticker.Stop()
 					defer sub.Unsubscribe()
@@ -156,7 +156,7 @@ func (pr *PairRegistry) handlePairCreated(lg types.Log) {
 	// Only non-indexed args live in lg.Data [pair, <uint>]
 	vals, err := evt.Inputs.NonIndexed().Unpack(lg.Data)
 	if err != nil {
-		log.Printf("[signals] PairCreated unpack err: %v", err)
+		telemetry.Debugf("[signals] PairCreated unpack err: %v", err)
 		return
 	}
 	pair := vals[0].(common.Address)
@@ -177,27 +177,26 @@ func (pr *PairRegistry) handlePairCreated(lg types.Log) {
 	k := tokKey(token0, token1)
 	pr.byTok[k] = pair
 	pr.mu.Unlock()
-	log.Printf("[signals] PairCreated pair=%s token0=%s token1=%s block=%d",
+	telemetry.Debugf("[signals] PairCreated pair=%s token0=%s token1=%s block=%d",
 		pair.Hex(), token0.Hex(), token1.Hex(), lg.BlockNumber)
 
 	// BACKFILL: catch Mint that happened in the same tx/block.
 	if pr.client != nil {
-		go func(block uint64, p common.Address) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			if evt, _ := BackfillMint(ctx, pr.client, p, block, block); evt != nil {
-				log.Printf("[liquidity][mined/backfill] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+		block := lg.BlockNumber
+		p := pair
+		go func() {
+			if evt, _ := BackfillMint(context.Background(), pr.client, p, block, block); evt != nil {
+				telemetry.Infof("[liquidity][mined/backfill] pair=%s sender=%s amount0=%s amount1=%s block=%d",
 					p.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), evt.Log.BlockNumber)
 				return
 			}
 			// small cushion
-			if evt, _ := BackfillMint(ctx, pr.client, p, block, block+1); evt != nil {
-				log.Printf("[liquidity][mined/backfill+] pair=%s sender=%s amount0=%s amount1=%s block=%d",
+			if evt, _ := BackfillMint(context.Background(), pr.client, p, block, block+1); evt != nil {
+				telemetry.Infof("[liquidity][mined/backfill+] pair=%s sender=%s amount0=%s amount1=%s block=%d",
 					p.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), evt.Log.BlockNumber)
 				return
 			}
-		}(lg.BlockNumber, pair)
+		}()
 	}
 }
 

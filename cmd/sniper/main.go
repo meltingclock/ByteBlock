@@ -8,6 +8,7 @@ import (
 
 	"github.com/meltingclock/biteblock_v1/internal/config"
 	"github.com/meltingclock/biteblock_v1/internal/telegram"
+	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
 
 /*
@@ -112,6 +113,9 @@ func main() {
 
 func main() {
 	// Load config (creates config.yml if missing)
+	telemetry.Start()
+	defer telemetry.Stop()
+
 	cfg, err := config.Load(config.DefaultPath)
 	if err != nil {
 		log.Fatalf("config load: %v", err)
@@ -132,7 +136,7 @@ func main() {
 		log.Fatalf("telegram init: %v", err)
 	}
 
-	log.Println("telegram mode: listening for commands")
+	telemetry.Infof("telegram mode: listening for commands")
 	if err := ctrl.Start(ctx); err != nil {
 		log.Fatalf("controller error: %v", err)
 	}

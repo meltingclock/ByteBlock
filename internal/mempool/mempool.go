@@ -3,7 +3,6 @@ package mempool
 import (
 	"context"
 	"errors"
-	"log"
 	"sync"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
 
 type TxHandler func(context.Context, *types.Transaction) error
@@ -123,7 +123,7 @@ func (w *Watcher) runLoop(ctx context.Context, txCh chan<- *types.Transaction) {
 			delayMs = 8000
 		}
 		delay := time.Duration(delayMs) * time.Millisecond
-		log.Printf("[mempool] subscribe error: %v; reconnecting in %s", err, delay)
+		telemetry.Warnf("[mempool] subscribe error: %v; reconnecting in %s", err, delay)
 		select {
 		case <-ctx.Done():
 			return
@@ -216,7 +216,7 @@ func (w *Watcher) subscribeOnce(ctx context.Context, txCh chan<- *types.Transact
 		close(txOut)
 		fg.Wait()
 	}()
-	log.Printf("[mempool] subscribed to newPendingTransactions")
+	telemetry.Infof("[mempool] subscribed to newPendingTransactions")
 
 	// forward to your existing worker pool
 	for {
@@ -232,7 +232,7 @@ func (w *Watcher) subscribeOnce(ctx context.Context, txCh chan<- *types.Transact
 			select {
 			case txCh <- tx:
 			default:
-				log.Printf("[mempool] txCh full (%d); dropping %s", len(txCh), tx.Hash().Hex())
+				telemetry.Warnf("[mempool] txCh full (%d); dropping %s", len(txCh), tx.Hash().Hex())
 			}
 		}
 	}
