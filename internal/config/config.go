@@ -17,6 +17,13 @@ type Config struct {
 	PRIVATE_KEY  string `yaml:"PRIVATE_KEY"`
 	IDENTITY_KEY string `yaml:"IDENTITY_KEY"`
 
+	// NEW: Safety settings
+	HONEYPOT_CHECK_ENABLED bool     `yaml:"HONEYPOT_CHECK_ENABLED"`
+	HONEYPOT_CHECK_MODE    string   `yaml:"HONEYPOT_CHECK_MODE"` // "always", "smart", "never"
+	TRUSTED_TOKENS         []string `yaml:"TRUSTED_TOKENS"`      // Skip check for these
+	TRUSTED_DEPLOYERS      []string `yaml:"TRUSTED_DEPLOYERS"`   // Skip check for tokens from these addresses
+	MIN_LIQUIDITY_ETH      string   `yaml:"MIN_LIQUIDITY_ETH"`   // Minimum liquidity to skip check
+
 	// Ignored for now
 	USE_ALERT bool `yaml:"USE_ALERT"`
 	DEBUG     bool `yaml:"DEBUG"`
@@ -32,6 +39,12 @@ func Default() *Config {
 		BOT_ADDRESS:  "",
 		PRIVATE_KEY:  "",
 		IDENTITY_KEY: "",
+
+		HONEYPOT_CHECK_ENABLED: true,
+		HONEYPOT_CHECK_MODE:    "smart", // Default to smart mode
+		TRUSTED_TOKENS:         []string{},
+		TRUSTED_DEPLOYERS:      []string{},
+		MIN_LIQUIDITY_ETH:      "10", // 10 ETH liquidity = probably safe
 
 		USE_ALERT: false,
 		DEBUG:     true,
@@ -55,6 +68,13 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("IDENTITY_KEY"); v != "" {
 		c.IDENTITY_KEY = v
+	}
+
+	if v := os.Getenv("HONEYPOT_CHECK_ENABLED"); v != "" {
+		c.HONEYPOT_CHECK_ENABLED = v == "true" || v == "1"
+	}
+	if v := os.Getenv("HONEYPOT_CHECK_MODE"); v != "" {
+		c.HONEYPOT_CHECK_MODE = v
 	}
 }
 
@@ -89,7 +109,6 @@ func (c *Config) Validate() error {
 	// You can enforce TELEGRAM_CHAT_ID != 0 if you want strict access.
 	return nil
 }
-
 
 func Save(path string, cfg *Config) error {
 	if path == "" {
