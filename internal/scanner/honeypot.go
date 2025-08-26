@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -21,17 +22,16 @@ type HoneypotChecker struct {
 	routerABI abi.ABI
 	weth      common.Address
 	factory   common.Address
+
+	// Cache with TTL
+	cache    map[common.Address]*cacheEntry
+	cacheMu  sync.RWMutex
+	cacheTTL time.Duration
 }
 
-func NewHoneypotChecker(ec *ethclient.Client, dex *v2.Registry) *HoneypotChecker {
-	routerABI, _ := abi.JSON(strings.NewReader(v2.RouterABI))
-	return &HoneypotChecker{
-		ec:        ec,
-		router:    dex.Router(),
-		routerABI: routerABI,
-		weth:      dex.WETH(),
-		factory:   dex.Factory(),
-	}
+type cacheEntry struct {
+	safety    *TokenSafety
+	timestamp time.Time
 }
 
 type TokenSafety struct {
@@ -76,38 +76,148 @@ type TokenSafety struct {
 	CheckedAt int64 // Unix timestamp of when checks was performed
 }
 
-// CheckToken performs comprehensive safety analysis
+func NewHoneypotChecker(ec *ethclient.Client, dex *v2.Registry) *HoneypotChecker {
+	routerABI, _ := abi.JSON(strings.NewReader(v2.RouterABI))
+	h := &HoneypotChecker{
+		ec:        ec,
+		router:    dex.Router(),
+		routerABI: routerABI,
+		weth:      dex.WETH(),
+		factory:   dex.Factory(),
+		cache:     make(map[common.Address]*cacheEntry),
+		cacheTTL:  5 * time.Minute, // Cache for 5 minutes
+	}
+
+	go h.cleanupCache()
+
+	return h
+}
+
+func (h *HoneypotChecker) cleanupCache() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		h.cacheMu.Lock()
+		now := time.Now()
+		for addr, entry := range h.cache {
+			if now.Sub(entry.timestamp) > h.cacheTTL {
+				delete(h.cache, addr)
+			}
+		}
+		h.cacheMu.Unlock()
+	}
+
+}
+
 func (h *HoneypotChecker) CheckToken(ctx context.Context, token common.Address) (*TokenSafety, error) {
+	// Check cache first
+	h.cacheMu.RLock()
+	if entry, exists := h.cache[token]; exists {
+		if time.Since(entry.timestamp) < h.cacheTTL {
+			h.cacheMu.RUnlock()
+			telemetry.Debugf("[honeypot] cache hit for %s", token.Hex())
+			return entry.safety, nil
+		}
+	}
+	h.cacheMu.RUnlock()
+
 	safety := &TokenSafety{
 		Token:       token,
-		SafetyScore: 100, // Start optimistic, deduct points for risks
+		SafetyScore: 100,
 		RiskFactors: []string{},
 		IsHoneypot:  false,
+		CheckedAt:   time.Now().Unix(),
 	}
 
 	// Set timeout for all checks
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// 1. Get basic token info
-	h.getTokenInfo(ctx, safety)
+	// Run checks in parallel for speed
+	var wg sync.WaitGroup
+	//r mu sync.Mutex
 
-	// 2. Check ownership
-	h.checkOwnership(ctx, safety)
+	// 1. Basic token info
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.getTokenInfo(ctx, safety)
+	}()
 
-	// 3. Check for dangerous functions
-	h.checkDangerousFunctions(ctx, safety)
+	// 2. Ownership check
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.checkOwnership(ctx, safety)
+	}()
 
-	// 4. Simulate buy/sell transactions
+	// 3. Dangerous functions check
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.checkDangerousFunctions(ctx, safety)
+	}()
+
+	// Wait for parallel checks
+	wg.Wait()
+
+	// 4. Simulate trades (sequential - depends on other checks)
 	h.simulateTrades(ctx, safety)
 
-	// 5. Check for liquidity
+	// 5. Check liquidity
 	h.checkLiquidity(ctx, safety)
 
-	// 6. Calculate final safety score
+	// 6. Calculate final score
 	h.calculateFinalScore(safety)
 
+	// Cache the result
+	h.cacheMu.Lock()
+	h.cache[token] = &cacheEntry{
+		safety:    safety,
+		timestamp: time.Now(),
+	}
+	h.cacheMu.Unlock()
+
 	return safety, nil
+}
+
+// Quick safety check for auto-buy (lightweight version)
+func (h *HoneypotChecker) QuickCheck(ctx context.Context, token common.Address) (bool, error) {
+	// Check cache first
+	h.cacheMu.RLock()
+	if entry, exists := h.cache[token]; exists {
+		if time.Since(entry.timestamp) < h.cacheTTL {
+			h.cacheMu.RUnlock()
+			return !entry.safety.IsHoneypot && entry.safety.SafetyScore >= 40, nil
+		}
+	}
+	h.cacheMu.RUnlock()
+
+	// Quick checks only
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// Check for contract code
+	code, err := h.ec.CodeAt(ctx, token, nil)
+	if err != nil || len(code) == 0 {
+		return false, fmt.Errorf("no contract code")
+	}
+
+	// Quick honeypot pattern check
+	codeHex := common.Bytes2Hex(code)
+	dangerousPatterns := []string{
+		"b515566a", // addBots
+		"273123b7", // delBots
+		"e47d6060", // isBlacklisted
+	}
+
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(codeHex, pattern) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // getTokenInfo retrieves basic token information

@@ -20,6 +20,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 
+	"github.com/meltingclock/biteblock_v1/internal/bundle"
 	"github.com/meltingclock/biteblock_v1/internal/config"
 	v2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
 	"github.com/meltingclock/biteblock_v1/internal/mempool"
@@ -94,6 +95,11 @@ type Controller struct {
 	activeNet string // NEW: "ethereum" | "bsc" | "base"
 
 	autoBuyEnabled bool // Runtime toogle
+
+	// Bundle execution
+	bundler      *bundle.Bundler
+	useFlashbots bool   // Future use
+	bribeAmount  string // ETH Amount for miner bribe
 }
 
 type Position struct {
@@ -1337,6 +1343,191 @@ func (c *Controller) executeBuyTransaction(ctx context.Context, token common.Add
 
 	return signedTx.Hash(), nil
 }
+
+func (c *Controller) executeBuyWithBundle(ctx context.Context, token common.Address, ethAmount *big.Int) (common.Hash, error) {
+	// Build swap transaction (unsigned)
+	nonce, err := c.ethClient.PendingNonceAt(ctx, c.walletAddr)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("get nonce: %w", err)
+	}
+
+	// Build swap data
+	path := []common.Address{c.dex.WETH(), token}
+	deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
+
+	// Calculate minimum output slippage
+	slippage := big.NewInt(int64(c.Cfg.SLIPPAGE_PERCENT))
+	amountOutMin := new(big.Int).Mul(ethAmount, big.NewInt(100-slippage.Int64()))
+	amountOutMin.Div(amountOutMin, big.NewInt(100))
+
+	data, err := c.routerABI.Pack(
+		"swapExactETHForTokensSupportingFeeOnTransferTokens",
+		amountOutMin,
+		path,
+		c.walletAddr,
+		deadline,
+	)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("pack swap: %w", err)
+	}
+
+	// Get competitive gas price
+	gasPrice, err := c.ethClient.SuggestGasPrice(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	// Apply gas boost for bundle
+	boost := big.NewInt(int64(150)) // 50% boost for bundles
+	gasPrice = new(big.Int).Mul(gasPrice, boost)
+	gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
+
+	// Create transaction
+	tx := types.NewTransaction(
+		nonce,
+		c.dex.Router(),
+		ethAmount,
+		uint64(300000),
+		gasPrice,
+		data,
+	)
+
+	chainID, err := c.ethClient.ChainID(ctx)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("failed to get chain ID: %w", err)
+	}
+
+	// Sign transaction
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("sign tx: %w", err)
+	}
+
+	// Parse bribe amount
+	bribe, _ := parseEthAmount(c.bribeAmount)
+
+	// Create bundle with optional bribe
+	bundle, err := c.bundler.CreateSniperBundle(ctx, signedTx, bribe)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("create bundle: %w", err)
+	}
+
+	// Simulate bundle first
+	sim, err := c.bundler.SimulateBundle(ctx, bundle)
+	if err != nil {
+		telemetry.Warnf("[bundle] simulation failed: %v", err)
+		// Fall back to normal transaction
+		return c.executeBuyNormal(ctx, signedTx)
+	}
+
+	if !sim.Success {
+		telemetry.Warnf("[bundle] simulation failed: %s", sim.Error)
+		// Fall back to normal transaction
+		return c.executeBuyNormal(ctx, signedTx)
+	}
+
+	telemetry.Infof("[bundle] simulation success, gas used: %d", sim.TotalGasUsed)
+
+	// Send bundle to multiple blocks for better inclusion
+	currentBlock, _ := c.ethClient.BlockNumber(ctx)
+	var bundleHash string
+
+	for i := uint64(1); i <= 3; i++ {
+		bundle.BlockNumber = new(big.Int).SetUint64(currentBlock + i)
+		hash, err := c.bundler.SendBundle(ctx, bundle)
+		if err != nil {
+			telemetry.Errorf("[bundle] send failed for block %d: %v", currentBlock+i, err)
+			continue
+		}
+		bundleHash = hash
+		telemetry.Infof("[bundle] sent to block %d: %s", currentBlock+i, hash)
+	}
+
+	if bundleHash == "" {
+		// All bundle attempts failed, fall back to normal tx
+		telemetry.Warnf("[bundle] all attempts failed, falling back to mempool")
+		return c.executeBuyNormal(ctx, signedTx)
+	}
+
+	// Monitor bundle inclusion
+	go c.monitorBundleInclusion(ctx, signedTx.Hash(), bundleHash, currentBlock+1)
+
+	return signedTx.Hash(), nil
+}
+
+// Helper to send normal transaction
+func (c *Controller) executeBuyNormal(ctx context.Context, signedTx *types.Transaction) (common.Hash, error) {
+	err := c.ethClient.SendTransaction(ctx, signedTx)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("send tx: %w", err)
+	}
+	telemetry.Infof("[tx] sent normal tx: %s", signedTx.Hash().Hex())
+	return signedTx.Hash(), nil
+}
+
+// Monitor if bundle was included
+func (c *Controller) monitorBundleInclusion(ctx context.Context, txHash common.Hash, bundleHash string, targetBlock uint64) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			telemetry.Warnf("[bundle] monitoring timeout for %s", txHash.Hex())
+			return
+		case <-ticker.C:
+			receipt, err := c.ethClient.TransactionReceipt(ctx, txHash)
+			if err == nil && receipt != nil {
+				telemetry.Infof("[bundle] INCLUDED in block %d, tx: %s",
+					receipt.BlockNumber.Uint64(), txHash.Hex())
+				return
+			}
+
+			currentBlock, _ := c.ethClient.BlockNumber(ctx)
+			if currentBlock > targetBlock+5 {
+				telemetry.Warnf("[bundle] NOT included after 5 blocks, tx: %s", txHash.Hex())
+				return
+			}
+		}
+	}
+}
+
+/*
+// Update executeAutoBuy to use bundles
+func (c *Controller) executeAutoBuyWithBundle(ctx context.Context, signal *signals.LiquiditySignal, scanReport *scanner.Report, chatID int64) {
+	// ... existing validation code ...
+
+	// === EXECUTION with BUNDLE ===
+	var txHash common.Hash
+	var err error
+
+	if c.useFlashbots && c.bundler != nil {
+		c.reply(chatID, fmt.Sprintf(
+			"🎯 *AUTO-BUY TRIGGERED (BUNDLE)*\nToken: `%s`%s\nAmount: %s ETH\nBribe: %s ETH\nGas: %s gwei",
+			tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, c.bribeAmount, formatGwei(gasPrice)))
+
+		txHash, err = c.executeBuyWithBundle(ctx, tokenToBuy, buyAmount)
+	} else {
+		// Fallback to normal execution
+		c.reply(chatID, fmt.Sprintf(
+			"🎯 *AUTO-BUY TRIGGERED*\nToken: `%s`%s\nAmount: %s ETH\nGas: %s gwei",
+			tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, formatGwei(gasPrice)))
+
+		txHash, err = c.executeBuyTransaction(ctx, tokenToBuy, buyAmount, gasPrice)
+	}
+
+	if err != nil {
+		c.reply(chatID, fmt.Sprintf("❌ Auto-buy failed: %v", err))
+		telemetry.Errorf("[autobuy] execution failed: %v", err)
+		return
+	}
+
+	// ... rest of success handling ...
+}
+*/
 
 // Identify which token to buy (the non-WETH token)
 func (c *Controller) identifyTargetToken(signal *signals.LiquiditySignal) common.Address {
