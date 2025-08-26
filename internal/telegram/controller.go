@@ -89,7 +89,7 @@ type Controller struct {
 	trustedTokens        map[common.Address]bool                 // Skip check for these
 	trustedDeployers     map[common.Address]bool                 // Skip check for tokens from these addresses
 	checkCache           map[common.Address]*scanner.TokenSafety // Cache results
-	cacheMu              sync.RWMutex
+	//cacheMu              sync.RWMutex
 
 	activeNet string // NEW: "ethereum" | "bsc" | "base"
 
@@ -504,160 +504,6 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 				c.activeNet = arg
 				c.reply(chatID, "✅ Selected network: *"+arg+"*.\nSend /start to apply.")
-			case strings.HasPrefix(text, "/safety"):
-				// Show or change safety mode
-				parts := strings.Fields(text)
-				if len(parts) < 2 {
-					// Show current settings
-					c.reply(chatID, fmt.Sprintf(
-						"*Current Safety Settings:*\n\n"+
-							"Enabled: `%v`\n"+
-							"Mode: `%s`\n"+
-							"Trusted Tokens: `%d`\n"+
-							"Trusted Deployers: `%d`\n\n"+
-							"*Commands:*\n"+
-							"/safety always - Check all tokens\n"+
-							"/safety smart - Skip trusted tokens\n"+
-							"/safety never - Disable all checks\n"+
-							"/safety on - Enable checks\n"+
-							"/safety off - Disable checks",
-						c.honeypotCheckEnabled,
-						c.honeypotCheckMode,
-						len(c.trustedTokens),
-						len(c.trustedDeployers)))
-					break
-				}
-
-				mode := strings.ToLower(parts[1])
-
-				switch mode {
-				case "always", "smart", "never":
-					// Change mode
-					c.honeypotCheckMode = mode
-					c.honeypotCheckEnabled = true // Auto-enable when setting mode
-
-					// Update config file
-					c.Cfg.HONEYPOT_CHECK_MODE = mode
-					c.Cfg.HONEYPOT_CHECK_ENABLED = true
-					if err := config.Save(c.Path, c.Cfg); err != nil {
-						c.reply(chatID, fmt.Sprintf("⚠️ Could not save config: %v", err))
-					}
-
-					emoji := "🛡"
-					switch mode {
-					case "never":
-						emoji = "⚠️"
-					case "smart":
-						emoji = "⚡"
-					}
-					c.reply(chatID, fmt.Sprintf("%s Safety mode set to: *%s*", emoji, mode))
-
-				case "on":
-					c.honeypotCheckEnabled = true
-					c.Cfg.HONEYPOT_CHECK_ENABLED = true
-					config.Save(c.Path, c.Cfg)
-					c.reply(chatID, "✅ Safety checks enabled")
-
-				case "off":
-					c.honeypotCheckEnabled = false
-					c.Cfg.HONEYPOT_CHECK_ENABLED = false
-					config.Save(c.Path, c.Cfg)
-					c.reply(chatID, "⚠️ Safety checks disabled - BE CAREFUL!")
-
-				default:
-					c.reply(chatID, "❌ Invalid option. Use: always, smart, never, on, or off")
-				}
-			case strings.HasPrefix(text, "/trust"):
-				// Add token to trusted list
-				parts := strings.Fields(text)
-				if len(parts) < 2 {
-					// Show trusted tokens
-					if len(c.trustedTokens) == 0 {
-						c.reply(chatID, "No trusted tokens configured")
-					} else {
-						msg := "*Trusted Tokens:*\n"
-						for token := range c.trustedTokens {
-							msg += fmt.Sprintf("`%s`\n", token.Hex())
-						}
-						c.reply(chatID, msg)
-					}
-					c.reply(chatID, "\n*Usage:* /trust <token_address>")
-					break
-				}
-
-				if !common.IsHexAddress(parts[1]) {
-					c.reply(chatID, "❌ Invalid address")
-					break
-				}
-
-				token := common.HexToAddress(parts[1])
-				c.trustedTokens[token] = true
-
-				// Update config file
-				c.Cfg.TRUSTED_TOKENS = append(c.Cfg.TRUSTED_TOKENS, token.Hex())
-				if err := config.Save(c.Path, c.Cfg); err != nil {
-					c.reply(chatID, fmt.Sprintf("⚠️ Could not save to config: %v", err))
-				}
-
-				c.reply(chatID, fmt.Sprintf("✅ Added `%s` to trusted tokens", token.Hex()))
-
-			case strings.HasPrefix(text, "/untrust"):
-				// Remove token from trusted list
-				parts := strings.Fields(text)
-				if len(parts) < 2 {
-					c.reply(chatID, "📝 Usage: /untrust <token_address>")
-					break
-				}
-
-				if !common.IsHexAddress(parts[1]) {
-					c.reply(chatID, "❌ Invalid address")
-					break
-				}
-
-				token := common.HexToAddress(parts[1])
-				delete(c.trustedTokens, token)
-
-				// Update config file
-				newTrusted := []string{}
-				for _, addr := range c.Cfg.TRUSTED_TOKENS {
-					if !strings.EqualFold(addr, token.Hex()) {
-						newTrusted = append(newTrusted, addr)
-					}
-				}
-				c.Cfg.TRUSTED_TOKENS = newTrusted
-				config.Save(c.Path, c.Cfg)
-
-				c.reply(chatID, fmt.Sprintf("✅ Removed `%s` from trusted tokens", token.Hex()))
-
-			case strings.HasPrefix(text, "/reload"):
-				// Reload settings from config file
-				newCfg, err := config.Load(c.Path)
-				if err != nil {
-					c.reply(chatID, fmt.Sprintf("❌ Failed to reload config: %v", err))
-					break
-				}
-
-				// Update runtime settings
-				c.Cfg = newCfg
-				c.honeypotCheckEnabled = newCfg.HONEYPOT_CHECK_ENABLED
-				c.honeypotCheckMode = newCfg.HONEYPOT_CHECK_MODE
-
-				// Reload trusted lists
-				c.trustedTokens = make(map[common.Address]bool)
-				for _, addr := range newCfg.TRUSTED_TOKENS {
-					if common.IsHexAddress(addr) {
-						c.trustedTokens[common.HexToAddress(addr)] = true
-					}
-				}
-
-				c.trustedDeployers = make(map[common.Address]bool)
-				for _, addr := range newCfg.TRUSTED_DEPLOYERS {
-					if common.IsHexAddress(addr) {
-						c.trustedDeployers[common.HexToAddress(addr)] = true
-					}
-				}
-
-				c.reply(chatID, "✅ Configuration reloaded from file")
 			case strings.HasPrefix(text, "/start"):
 				if c.running {
 					c.reply(chatID, "ℹ️ Already running.")
@@ -677,7 +523,7 @@ func (c *Controller) Start(ctx context.Context) error {
 					c.running = false
 					c.reply(chatID, "🔴 Stopped.")
 				}()
-			case strings.HasPrefix(text, "/buy "):
+			case strings.HasPrefix(text, "/buy"):
 				if c.privateKey == nil {
 					c.reply(chatID, "❌ No private key configured. Cannot execute trades.")
 					break
@@ -715,220 +561,97 @@ func (c *Controller) Start(ctx context.Context) error {
 					break
 				}
 
-				// ============= SMART HONEYPOT CHECK =============
-				deployer := common.Address{} // Could get from PairCreated event if available
-				shouldCheck, skipReason := c.shouldCheckToken(token, deployer)
+				// ============ HONEYPOT CHECK ============
+				c.reply(chatID, "🔍 Running safety analysis...")
 
-				if shouldCheck {
-					c.reply(chatID, "🔍 Running safety analysis...")
-
-					checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
-					safety, err := checker.CheckToken(context.Background(), token)
-
-					if err != nil {
-						c.reply(chatID, fmt.Sprintf("⚠️ Safety check error: %v\nProceed with caution!", err))
-					} else {
-						// Cache the result
-						safety.CheckedAt = time.Now().Unix()
-						c.cacheMu.Lock()
-						c.checkCache[token] = safety
-						c.cacheMu.Unlock()
-
-						// Display safety report
-						safetyEmoji := "🟢"
-						recommendation := "SAFE TO TRADE"
-
-						if safety.IsHoneypot {
-							safetyEmoji = "🔴"
-							recommendation = "DO NOT BUY -HONEYPOT!"
-						} else if safety.SafetyScore < 40 {
-							safetyEmoji = "🔴"
-							recommendation = "HIGH RISK - NOT RECOMMENDED"
-						} else if safety.SafetyScore < 70 {
-							safetyEmoji = "🟡"
-							recommendation = "MODERATE RISK - PROCEED WITH CAUTION"
-						}
-
-						// Build safety report
-						report := fmt.Sprintf(
-							"%s *Safety Score: %d/100*\n"+
-								"*%s*\n\n"+
-								"*Token Info:*\n"+
-								"Name: %s\n"+
-								"Symbol: %s\n\n"+
-								"*Trade Simulation:*\n"+
-								"✅ Can Buy: %v\n"+
-								"✅ Can Approve: %v\n"+
-								"✅ Can Sell: %v\n\n"+
-								"*Tax Analysis:*\n"+
-								"Buy Tax: %.1f%%\n"+
-								"Sell Tax: %.1f%%\n\n"+
-								"*Contract Analysis:*\n"+
-								"Owner: %v (Renounced: %v)\n"+
-								"Has Mint: %v\n"+
-								"Has Pause: %v\n"+
-								"Has Blacklist: %v\n"+
-								"Max Wallet: %v\n\n"+
-								"*Liquidity:*\n"+
-								"ETH in Pool: %s\n",
-							safetyEmoji, safety.SafetyScore,
-							recommendation,
-							safety.Name, safety.Symbol,
-							safety.CanBuy, safety.CanApprove, safety.CanSell,
-							safety.BuyTax, safety.SellTax,
-							safety.HasOwner, safety.IsRenounced,
-							safety.HasMintFunction,
-							safety.HasPauseFunction,
-							safety.HasBlacklist,
-							safety.MaxWalletLimit,
-							formatEth(safety.LiquidityETH),
-						)
-
-						// Add risk factors if any
-						if len(safety.RiskFactors) > 0 {
-							report += "\n*Risk Factors:*\n"
-							for _, risk := range safety.RiskFactors {
-								report += fmt.Sprintf("⚠️ %s\n", risk)
-							}
-						}
-
-						// Add simulation error if any
-						if safety.SimulationError != "" {
-							report += fmt.Sprintf("\n*Simulation Error:*\n%s\n", safety.SimulationError)
-						}
-
-						c.reply(chatID, report)
-
-						// Block if honeypot detected
-						if safety.IsHoneypot {
-							c.reply(chatID, "🚨 *TRANSACTION BLOCKED*\nHoneypot detected! This token cannot be sold.")
-							break
-						}
-
-						// Warn if risky
-						if safety.SafetyScore < 40 {
-							c.reply(chatID, "⚠️ *HIGH RISK TOKEN*\nUse /forcebuy to proceed anyway (not recommended)")
-							break
-						}
-
-						if safety.SafetyScore < 70 {
-							c.reply(chatID, "⚠️ *MODERATE RISK*\nProceed with caution. Reply 'yes' to continue.")
-							// You could implement a confirmation flow here
-						}
-					}
+				checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
+				safety, err := checker.CheckToken(context.Background(), token)
+				if err != nil {
+					c.reply(chatID, fmt.Sprintf("⚠️ Safety check error: %v\nProceed with caution!", err))
+					// Don't block trade, just warn
 				} else {
-					// Skipped check - notify user why
-					skipMsg := "⚡ *Fast Mode* - "
-					switch skipReason {
-					case "checks_disabled":
-						skipMsg += "Safety checks disabled"
-					case "cached_safe":
-						skipMsg += "Recently verified as safe"
-					case "trusted_tokens":
-						skipMsg += "Trusted token"
-					case "trusted_deployer":
-						skipMsg += "Trusted developer"
-					case "well_known_token":
-						skipMsg += "Well-known token"
-					default:
-						skipMsg += "Check skipped"
+					// Display safety report
+					safetyEmoji := "🟢"
+					recommendation := "SAFE TO TRADE"
+
+					if safety.IsHoneypot {
+						safetyEmoji = "🔴"
+						recommendation = "DO NOT BUY - HONEYPOT!"
+					} else if safety.SafetyScore < 40 {
+						safetyEmoji = "🔴"
+						recommendation = "HIGH RISK - NOT RECOMMENDED"
+					} else if safety.SafetyScore < 70 {
+						safetyEmoji = "🟡"
+						recommendation = "MODERATE RISK - BE CAREFUL"
 					}
-					c.reply(chatID, skipMsg)
+
+					// Build safety report
+					report := fmt.Sprintf(
+						"%s *Safety Score: %d/100*\n"+
+							"*%s*\n\n"+
+							"*Token Info:*\n"+
+							"Name: %s\n"+
+							"Symbol: %s\n\n"+
+							"*Trade Simulation:*\n"+
+							"✅ Can Buy: %v\n"+
+							"✅ Can Approve: %v\n"+
+							"✅ Can Sell: %v\n\n"+
+							"*Tax Analysis:*\n"+
+							"Buy Tax: %.1f%%\n"+
+							"Sell Tax: %.1f%%\n\n"+
+							"*Contract Analysis:*\n"+
+							"Owner: %v (Renounced: %v)\n"+
+							"Has Mint: %v\n"+
+							"Has Pause: %v\n"+
+							"Has Blacklist: %v\n"+
+							"Max Wallet: %v\n\n"+
+							"*Liquidity:*\n"+
+							"ETH in Pool: %s\n",
+						safetyEmoji, safety.SafetyScore,
+						recommendation,
+						safety.Name, safety.Symbol,
+						safety.CanBuy, safety.CanApprove, safety.CanSell,
+						safety.BuyTax, safety.SellTax,
+						safety.HasOwner, safety.IsRenounced,
+						safety.HasMintFunction,
+						safety.HasPauseFunction,
+						safety.HasBlacklist,
+						safety.MaxWalletLimit,
+						formatEth(safety.LiquidityETH),
+					)
+
+					// Add risk factors if any
+					if len(safety.RiskFactors) > 0 {
+						report += "\n*Risk Factors:*\n"
+						for _, risk := range safety.RiskFactors {
+							report += fmt.Sprintf("⚠️ %s\n", risk)
+						}
+					}
+
+					// Add simulation error if any
+					if safety.SimulationError != "" {
+						report += fmt.Sprintf("\n*Simulation Error:*\n%s\n", safety.SimulationError)
+					}
+
+					c.reply(chatID, report)
+
+					// Block if honeypot detected
+					if safety.IsHoneypot {
+						c.reply(chatID, "🚨 *TRANSACTION BLOCKED*\nHoneypot detected! This token cannot be sold.")
+						break
+					}
+
+					// Warn if risky
+					if safety.SafetyScore < 40 {
+						c.reply(chatID, "⚠️ *HIGH RISK TOKEN*\nUse /forcebuy to proceed anyway (not recommended)")
+						break
+					}
+
+					if safety.SafetyScore < 70 {
+						c.reply(chatID, "⚠️ *MODERATE RISK*\nProceed with caution. Reply 'yes' to continue.")
+						// You could implement a confirmation flow here
+					}
 				}
-
-				//c.reply(chatID, "🔍 Running safety analysis...")
-
-				//checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
-				//safety, err := checker.CheckToken(context.Background(), token)
-
-				/*
-					if err != nil {
-						c.reply(chatID, fmt.Sprintf("⚠️ Safety check error: %v\nProceed with caution!", err))
-						// Don't block trade, just warn
-					} else {
-						// Display safety report
-						safetyEmoji := "🟢"
-						recommendation := "SAFE TO TRADE"
-
-						if safety.IsHoneypot {
-							safetyEmoji = "🔴"
-							recommendation = "DO NOT BUY -HONEYPOT!"
-						} else if safety.SafetyScore < 40 {
-							safetyEmoji = "🔴"
-							recommendation = "HIGH RISK - NOT RECOMMENDED"
-						} else if safety.SafetyScore < 70 {
-							safetyEmoji = "🟡"
-							recommendation = "MODERATE RISK - PROCEED WITH CAUTION"
-						}
-
-						// Build safety report
-						report := fmt.Sprintf(
-							"%s *Safety Score: %d/100*\n"+
-								"*%s*\n\n"+
-								"*Token Info:*\n"+
-								"Name: %s\n"+
-								"Symbol: %s\n\n"+
-								"*Trade Simulation:*\n"+
-								"✅ Can Buy: %v\n"+
-								"✅ Can Approve: %v\n"+
-								"✅ Can Sell: %v\n\n"+
-								"*Tax Analysis:*\n"+
-								"Buy Tax: %.1f%%\n"+
-								"Sell Tax: %.1f%%\n\n"+
-								"*Contract Analysis:*\n"+
-								"Owner: %v (Renounced: %v)\n"+
-								"Has Mint: %v\n"+
-								"Has Pause: %v\n"+
-								"Has Blacklist: %v\n"+
-								"Max Wallet: %v\n\n"+
-								"*Liquidity:*\n"+
-								"ETH in Pool: %s\n",
-							safetyEmoji, safety.SafetyScore,
-							recommendation,
-							safety.Name, safety.Symbol,
-							safety.CanBuy, safety.CanApprove, safety.CanSell,
-							safety.BuyTax, safety.SellTax,
-							safety.HasOwner, safety.IsRenounced,
-							safety.HasMintFunction,
-							safety.HasPauseFunction,
-							safety.HasBlacklist,
-							safety.MaxWalletLimit,
-							formatEth(safety.LiquidityETH),
-						)
-
-						// Add risk factors if any
-						if len(safety.RiskFactors) > 0 {
-							report += "\n*Risk Factors:*\n"
-							for _, risk := range safety.RiskFactors {
-								report += fmt.Sprintf("⚠️ %s\n", risk)
-							}
-						}
-
-						// Add simulation error if any
-						if safety.SimulationError != "" {
-							report += fmt.Sprintf("\n*Simulation Error:*\n%s\n", safety.SimulationError)
-						}
-
-						c.reply(chatID, report)
-
-						// Block if honeypot detected
-						if safety.IsHoneypot {
-							c.reply(chatID, "🚨 *TRANSACTION BLOCKED*\nHoneypot detected! This token cannot be sold.")
-							break
-						}
-
-						// Warn if risky
-						if safety.SafetyScore < 40 {
-							c.reply(chatID, "⚠️ *HIGH RISK TOKEN*\nUse /forcebuy to proceed anyway (not recommended)")
-							break
-						}
-
-						if safety.SafetyScore < 70 {
-							c.reply(chatID, "⚠️ *MODERATE RISK*\nProceed with caution. Reply 'yes' to continue.")
-							// You could implement a confirmation flow here
-						}
-					}
-				*/
 
 				// Execute buy if safe
 				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", formatEth(ethAmount)))
@@ -950,105 +673,23 @@ func (c *Controller) Start(ctx context.Context) error {
 				c.positionsMu.Unlock()
 
 				c.reply(chatID, fmt.Sprintf(
-					"✅ *Buy Successful!*\n"+
+					"✅ *Buy Executed!*\n"+
 						"Token: `%s`\n"+
 						"Amount: %s ETH\n"+
-						"Tx: `%s`\n"+
-						"Explorer: https://etherscan.io/tx/%s",
-					token.Hex(), formatEth(ethAmount),
-					txHash.Hex(), txHash.Hex(),
-				))
-			case strings.HasPrefix(text, "/quickbuy"), strings.HasPrefix(text, "/qb"):
-				// Force skip honeypot check for maximum speed
-				parts := strings.Fields(text)
-				if len(parts) >= 3 {
-					c.reply(chatID, "📝 Usage: /quickbuy <token> <amount>")
+						"Tx: `%s`",
+					token.Hex(), formatEth(ethAmount), txHash.Hex()))
+			case strings.HasPrefix(text, "/forcebuy"):
+				if c.privateKey == nil {
+					c.reply(chatID, "❌ No private key configured. Cannot execute trades.")
 					break
 				}
 
-				// Save current mode
-				savedEnabled := c.honeypotCheckEnabled
-				savedMode := c.honeypotCheckMode
-
-				// Temporarily disable
-				c.honeypotCheckEnabled = false
-
-				// Execute buy (reuse existing buy logic)
-				tokenStr := parts[1]
-				if !common.IsHexAddress(tokenStr) {
-					c.reply(chatID, "❌ Invalid token address")
-					break
-				}
-				token := common.HexToAddress(tokenStr)
-
-				ethAmount, err := parseEthAmount(parts[2])
-				if err != nil {
-					c.reply(chatID, fmt.Sprintf("❌ Invalid amount: %v", err))
-					break
-				}
-
-				// Check wallet balance
-				balance, err := c.getETHBalance()
-				if err != nil {
-					c.reply(chatID, "❌ Could not check wallet balance")
-					break
-				}
-
-				if balance.Cmp(ethAmount) < 0 {
-					c.reply(chatID, fmt.Sprintf("❌ Insufficient balance\nNeeded: %s ETH\nHave: %s ETH",
-						formatEth(ethAmount), formatEth(balance)))
-					break
-				}
-
-				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", formatEth(ethAmount)))
-
-				txHash, err := c.executeBuy(token, ethAmount)
-				if err != nil {
-					c.reply(chatID, fmt.Sprintf("❌ Buy failed: %v", err))
-					break
-				}
-
-				// Save position
-				c.positionsMu.Lock()
-				c.positions[token] = &Position{
-					Token:     token,
-					EthSpent:  ethAmount,
-					EntryTime: time.Now(),
-					TxHash:    txHash,
-				}
-				c.positionsMu.Unlock()
-
-				c.reply(chatID, fmt.Sprintf(
-					"✅ *Buy Successful!*\n"+
-						"Token: `%s`\n"+
-						"Amount: %s ETH\n"+
-						"Tx: `%s`\n"+
-						"Explorer: https://etherscan.io/tx/%s",
-					token.Hex(), formatEth(ethAmount),
-					txHash.Hex(), txHash.Hex(),
-				))
-
-				// Restore settings
-				c.honeypotCheckEnabled = savedEnabled
-				c.honeypotCheckMode = savedMode
-
-				c.reply(chatID, "⚡ Quick buy executed (safety checks skipped)")
-
-			case strings.HasPrefix(text, "/safebuy"), strings.HasPrefix(text, "/sb"):
-				// Force maximum safety for this transaction
 				parts := strings.Fields(text)
 				if len(parts) < 3 {
-					c.reply(chatID, "📝 Usage: /safebuy <token> <amount>")
+					c.reply(chatID, "📝 Usage: /buy <token_address> <eth_amount>\nExample: /buy 0x... 0.1")
 					break
 				}
 
-				// Save current mode
-				savedMode := c.honeypotCheckMode
-
-				// Force always mode
-				c.honeypotCheckMode = "always"
-
-				// Execute buy (reuse existing buy logic)
 				tokenStr := parts[1]
 				if !common.IsHexAddress(tokenStr) {
 					c.reply(chatID, "❌ Invalid token address")
@@ -1075,6 +716,8 @@ func (c *Controller) Start(ctx context.Context) error {
 					break
 				}
 
+				c.reply(chatID, "⚠️ *WARNING: Bypassing all safety checks!*")
+
 				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", formatEth(ethAmount)))
 
 				txHash, err := c.executeBuy(token, ethAmount)
@@ -1094,19 +737,11 @@ func (c *Controller) Start(ctx context.Context) error {
 				c.positionsMu.Unlock()
 
 				c.reply(chatID, fmt.Sprintf(
-					"✅ *Buy Successful!*\n"+
+					"✅ *Buy Executed!*\n"+
 						"Token: `%s`\n"+
 						"Amount: %s ETH\n"+
-						"Tx: `%s`\n"+
-						"Explorer: https://etherscan.io/tx/%s",
-					token.Hex(), formatEth(ethAmount),
-					txHash.Hex(), txHash.Hex(),
-				))
-
-				// Restore mode
-				c.honeypotCheckMode = savedMode
-
-				c.reply(chatID, "🛡 Safe buy executed (full safety check)")
+						"Tx: `%s`",
+					token.Hex(), formatEth(ethAmount), txHash.Hex()))
 			case strings.HasPrefix(text, "/check"):
 				parts := strings.Fields(text)
 				if len(parts) < 2 {
@@ -1714,53 +1349,4 @@ func loadPrivateKey(privateKeyHex string) (*ecdsa.PrivateKey, common.Address, er
 	address := crypto.PubkeyToAddress(*publicKeyECDSA)
 
 	return privateKey, address, nil
-}
-
-// shouldCheckToken determines if honeypot check should run
-func (c *Controller) shouldCheckToken(token common.Address, deployer common.Address) (bool, string) {
-	// Mode: never - skip all checks
-	if c.honeypotCheckMode == "never" || !c.honeypotCheckEnabled {
-		return false, "checks_disabled"
-	}
-
-	// Check cache first (valid for 5 minutes)
-	c.cacheMu.RLock()
-	if cached, exists := c.checkCache[token]; exists {
-		if time.Since(time.Unix(cached.CheckedAt, 0)) < 5*time.Minute {
-			c.cacheMu.RUnlock()
-			telemetry.Debugf("[honeypot] using cached result for %s", token.Hex())
-			return false, "cached_safe"
-		}
-	}
-	c.cacheMu.RUnlock()
-
-	// Mode: always - check everything
-	if c.honeypotCheckMode == "always" {
-		return true, ""
-	}
-
-	// Mode: smart - use intelligent filtering
-
-	// Skip if trusted token
-	if c.trustedTokens[token] {
-		telemetry.Debugf("[honeypot] skipping token from trusted deployer %s", deployer.Hex())
-		return false, "trusted_deployer"
-	}
-
-	// Skip well-known tokens (you can expand this list)
-	wellKnownTokens := map[common.Address]bool{
-		common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"): true, // USDC
-		common.HexToAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7"): true, // USDT
-		common.HexToAddress("0x6B175474E89094C44Da98b954EedeAC495271d0F"): true, // DAI
-		common.HexToAddress("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"): true, // WBTC
-		// Add more as needed
-	}
-
-	if wellKnownTokens[token] {
-		telemetry.Debugf("[honeypot] skipping well-known token %s", token.Hex())
-		return false, "well_known_token"
-	}
-
-	// Default: check unknown tokens
-	return true, ""
 }
