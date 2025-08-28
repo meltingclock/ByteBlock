@@ -16,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/meltingclock/biteblock_v1/internal/helpers"
 	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
 
@@ -197,7 +198,7 @@ func (b *Bundler) CreateSniperBundle(
 		}
 
 		bundle.Transactions = append(bundle.Transactions, signedBribe)
-		telemetry.Debugf("[bundle] added bribe: %s ETH", formatEth(bribeAmount))
+		telemetry.Debugf("[bundle] added bribe: %s ETH", helpers.FormatEth(bribeAmount))
 	}
 
 	return bundle, nil
@@ -275,14 +276,4 @@ func (b *Bundler) signFlashbots(body []byte) (string, error) {
 	// Format: address:signature
 	addr := crypto.PubkeyToAddress(b.flashbotsKey.PublicKey)
 	return fmt.Sprintf("%s:0x%s", addr.Hex(), hex.EncodeToString(sig)), nil
-}
-
-func formatEth(wei *big.Int) string {
-	if wei == nil {
-		return "0"
-	}
-	eth := new(big.Float).SetInt(wei)
-	eth.Quo(eth, big.NewFloat(1e18))
-	f, _ := eth.Float64()
-	return fmt.Sprintf("%.4f", f)
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	v2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
+	"github.com/meltingclock/biteblock_v1/internal/helpers"
 	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
 
@@ -394,7 +395,7 @@ func (h *HoneypotChecker) checkDangerousFunctions(ctx context.Context, safety *T
 // simulateTrades simulates buy and sell to detect honeypots
 func (h *HoneypotChecker) simulateTrades(ctx context.Context, safety *TokenSafety) {
 	// Test with small amount (0.001 ETH)
-	testAmount := big.NewInt(1000000000000000) // 0.001 ETH in wei
+	testAmount := big.NewInt(1e15) // 0.001 ETH in wei
 
 	// Use a test address (not zero address, as some contracts check for it)
 	testAddr := common.HexToAddress("0x0000000000000000000000000000000000000001")
@@ -591,11 +592,11 @@ func (h *HoneypotChecker) checkLiquidity(ctx context.Context, safety *TokenSafet
 			}
 
 			// Check minimum liquidity (0.5 ETH minimum)
-			minLiqudity := big.NewInt(500000000000000000) // 0.5 ETH
+			minLiqudity := big.NewInt(5e17) // 0.5 ETH
 			if safety.LiquidityETH.Cmp(minLiqudity) < 0 {
 				safety.SafetyScore -= 40
 				safety.RiskFactors = append(safety.RiskFactors, "low_liquidity")
-				telemetry.Debugf("[honeypot] Low liquidity: %s ETH", formatWei(safety.LiquidityETH))
+				telemetry.Debugf("[honeypot] Low liquidity: %s ETH", helpers.FormatEth(safety.LiquidityETH))
 			}
 		}
 	}
@@ -631,14 +632,4 @@ func (h *HoneypotChecker) calculateFinalScore(safety *TokenSafety) {
 
 	telemetry.Infof("[honeypot] Final score for %s: %d/100 (honeypot: %v)",
 		safety.Token.Hex(), safety.SafetyScore, safety.IsHoneypot)
-}
-
-// Helper function
-func formatWei(wei *big.Int) string {
-	if wei == nil {
-		return "0"
-	}
-	eth := new(big.Float).SetInt(wei)
-	eth.Quo(eth, big.NewFloat(1e18))
-	return fmt.Sprintf("%.4f", eth)
 }

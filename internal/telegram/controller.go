@@ -23,6 +23,7 @@ import (
 	"github.com/meltingclock/biteblock_v1/internal/bundle"
 	"github.com/meltingclock/biteblock_v1/internal/config"
 	v2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
+	"github.com/meltingclock/biteblock_v1/internal/helpers"
 	"github.com/meltingclock/biteblock_v1/internal/mempool"
 	"github.com/meltingclock/biteblock_v1/internal/scanner"
 	"github.com/meltingclock/biteblock_v1/internal/signals"
@@ -224,7 +225,7 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 					walletAddr.Hex(), err))
 			} else {
 				c.reply(chatID, fmt.Sprintf("💰 Wallet: `%s`\nBalance: %s ETH",
-					walletAddr.Hex(), formatEth(balance)))
+					walletAddr.Hex(), helpers.FormatEth(balance)))
 			}
 		}
 	} else {
@@ -267,10 +268,10 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 
 	scan := scanner.New(ethCl, dex, scanner.Config{
 		RequireWethPair:   true,
-		MinEthLiquidity:   wei(c.Cfg.MIN_LIQUIDITY_ETH), // Use config value
-		MinTokenLiquidity: nil,                          // set when we want non-ETH pairs enforced
-		AllowCreators:     map[common.Address]bool{},    // empty = allow all
-		DenyCreators:      map[common.Address]bool{},    // can be filled later via telegram
+		MinEthLiquidity:   helpers.Wei(c.Cfg.MIN_LIQUIDITY_ETH), // Use config value
+		MinTokenLiquidity: nil,                                  // set when we want non-ETH pairs enforced
+		AllowCreators:     map[common.Address]bool{},            // empty = allow all
+		DenyCreators:      map[common.Address]bool{},            // can be filled later via telegram
 		Deadline:          250 * time.Millisecond,
 	})
 
@@ -309,7 +310,7 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 				}
 				// Passed all scanner filters!
 				telemetry.Infof("[liquidity][passed] pair=%s liquidity=%s ETH from=%s",
-					sig.Pair.Hex(), formatEth(rep.ETHInWei), sig.From.Hex())
+					sig.Pair.Hex(), helpers.FormatEth(rep.ETHInWei), sig.From.Hex())
 
 				// AUTO-BUY DECISION POINT
 				if c.autoBuyEnabled && c.privateKey != nil {
@@ -326,7 +327,7 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 					token := c.identifyTargetToken(sig)
 					liquidityStr := "Unknown"
 					if rep.ETHInWei != nil {
-						liquidityStr = formatEth(rep.ETHInWei) + " ETH"
+						liquidityStr = helpers.FormatEth(rep.ETHInWei) + " ETH"
 					}
 
 					// 👇 Console log (pending/liquidity)
@@ -612,7 +613,7 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 
 				amount := parts[1]
-				if _, err := parseEthAmount(amount); err != nil {
+				if _, err := helpers.EthToWei(amount); err != nil {
 					c.reply(chatID, "❌ Invalid amount. Examples: 0.1, 0.5, 1.0")
 					break
 				}
@@ -682,7 +683,7 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 				token := common.HexToAddress(tokenStr)
 
-				ethAmount, err := parseEthAmount(parts[2])
+				ethAmount, err := helpers.EthToWei(parts[2])
 				if err != nil {
 					c.reply(chatID, fmt.Sprintf("❌ Invalid amount: %v", err))
 					break
@@ -697,7 +698,7 @@ func (c *Controller) Start(ctx context.Context) error {
 
 				if balance.Cmp(ethAmount) < 0 {
 					c.reply(chatID, fmt.Sprintf("❌ Insufficient balance\nNeeded: %s ETH\nHave: %s ETH",
-						formatEth(ethAmount), formatEth(balance)))
+						helpers.FormatEth(ethAmount), helpers.FormatEth(balance)))
 					break
 				}
 
@@ -757,7 +758,7 @@ func (c *Controller) Start(ctx context.Context) error {
 						safety.HasPauseFunction,
 						safety.HasBlacklist,
 						safety.MaxWalletLimit,
-						formatEth(safety.LiquidityETH),
+						helpers.FormatEth(safety.LiquidityETH),
 					)
 
 					// Add risk factors if any
@@ -794,7 +795,7 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 
 				// Execute buy if safe
-				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", formatEth(ethAmount)))
+				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", helpers.FormatEth(ethAmount)))
 
 				txHash, err := c.executeBuy(token, ethAmount)
 				if err != nil {
@@ -817,7 +818,7 @@ func (c *Controller) Start(ctx context.Context) error {
 						"Token: `%s`\n"+
 						"Amount: %s ETH\n"+
 						"Tx: `%s`",
-					token.Hex(), formatEth(ethAmount), txHash.Hex()))
+					token.Hex(), helpers.FormatEth(ethAmount), txHash.Hex()))
 			case strings.HasPrefix(text, "/forcebuy"):
 				if c.privateKey == nil {
 					c.reply(chatID, "❌ No private key configured. Cannot execute trades.")
@@ -837,7 +838,7 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 				token := common.HexToAddress(tokenStr)
 
-				ethAmount, err := parseEthAmount(parts[2])
+				ethAmount, err := helpers.EthToWei(parts[2])
 				if err != nil {
 					c.reply(chatID, fmt.Sprintf("❌ Invalid amount: %v", err))
 					break
@@ -852,13 +853,13 @@ func (c *Controller) Start(ctx context.Context) error {
 
 				if balance.Cmp(ethAmount) < 0 {
 					c.reply(chatID, fmt.Sprintf("❌ Insufficient balance\nNeeded: %s ETH\nHave: %s ETH",
-						formatEth(ethAmount), formatEth(balance)))
+						helpers.FormatEth(ethAmount), helpers.FormatEth(balance)))
 					break
 				}
 
 				c.reply(chatID, "⚠️ *WARNING: Bypassing all safety checks!*")
 
-				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", formatEth(ethAmount)))
+				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", helpers.FormatEth(ethAmount)))
 
 				txHash, err := c.executeBuy(token, ethAmount)
 				if err != nil {
@@ -881,7 +882,7 @@ func (c *Controller) Start(ctx context.Context) error {
 						"Token: `%s`\n"+
 						"Amount: %s ETH\n"+
 						"Tx: `%s`",
-					token.Hex(), formatEth(ethAmount), txHash.Hex()))
+					token.Hex(), helpers.FormatEth(ethAmount), txHash.Hex()))
 			case strings.HasPrefix(text, "/check"):
 				parts := strings.Fields(text)
 				if len(parts) < 2 {
@@ -931,7 +932,7 @@ func (c *Controller) Start(ctx context.Context) error {
 					safety.SafetyScore,
 					safety.CanSell,
 					safety.BuyTax+safety.SellTax,
-					formatEth(safety.LiquidityETH),
+					helpers.FormatEth(safety.LiquidityETH),
 				)
 
 				if len(safety.RiskFactors) > 0 && len(safety.RiskFactors) <= 5 {
@@ -1026,7 +1027,7 @@ func (c *Controller) Start(ctx context.Context) error {
 							"Tx: `%s`\n\n",
 						token.Hex()[:10]+"..."+token.Hex()[36:],
 						balance.String(),
-						formatEth(pos.EthSpent),
+						helpers.FormatEth(pos.EthSpent),
 						pos.EntryTime.Format("15:04:05"),
 						pos.TxHash.Hex()[:10]+"...",
 					)
@@ -1050,7 +1051,7 @@ func (c *Controller) Start(ctx context.Context) error {
 					"💰 *Wallet Balance*\n"+
 						"Address: `%s`\n"+
 						"Balance: %s ETH",
-					c.walletAddr.Hex(), formatEth(balance)))
+					c.walletAddr.Hex(), helpers.FormatEth(balance)))
 			case strings.HasPrefix(text, "/status"):
 				state := "stopped"
 				if c.running {
@@ -1173,7 +1174,7 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 	}
 
 	// Get buy amount from config
-	buyAmount, err := parseEthAmount(c.Cfg.AUTO_BUY_AMOUNT)
+	buyAmount, err := helpers.EthToWei(c.Cfg.AUTO_BUY_AMOUNT)
 	if err != nil {
 		telemetry.Errorf("[autobuy] invalid buy amount: %s", c.Cfg.AUTO_BUY_AMOUNT)
 		return
@@ -1189,13 +1190,13 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 	}
 
 	// Need funds for buy + gas reserve
-	gasReserve := big.NewInt(10000000000000000) // 0.01 ETH for gas
+	gasReserve := big.NewInt(1e16) // 0.01 ETH for gas
 	required := new(big.Int).Add(buyAmount, gasReserve)
 
 	if balance.Cmp(required) < 0 {
 		c.reply(chatID, fmt.Sprintf(
 			"❌ Insufficient balance for auto-buy\nNeed: %s ETH\nHave: %s ETH",
-			formatEth(required), formatEth(balance)))
+			helpers.FormatEth(required), helpers.FormatEth(balance)))
 		return
 	}
 
@@ -1217,8 +1218,8 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 	maxGasWei := parseGweiToWei(c.Cfg.MAX_GAS_PRICE_GWEI)
 	if maxGasWei != nil && gasPrice.Cmp(maxGasWei) > 0 {
 		telemetry.Infof("[autobuy] gas too high: %s gwei > %s gwei max",
-			formatGwei(gasPrice), c.Cfg.MAX_GAS_PRICE_GWEI)
-		c.reply(chatID, fmt.Sprintf("⚠️ Gas too high: %s gwei", formatGwei(gasPrice)))
+			helpers.WeiToGwei(gasPrice), c.Cfg.MAX_GAS_PRICE_GWEI)
+		c.reply(chatID, fmt.Sprintf("⚠️ Gas too high: %s gwei", helpers.WeiToGwei(gasPrice)))
 		return
 	}
 
@@ -1252,12 +1253,12 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 	// Build informative message
 	liquidityInfo := ""
 	if scanReport.ETHInWei != nil {
-		liquidityInfo = fmt.Sprintf("\nLiquidity: %s ETH", formatEth(scanReport.ETHInWei))
+		liquidityInfo = fmt.Sprintf("\nLiquidity: %s ETH", helpers.FormatEth(scanReport.ETHInWei))
 	}
 
 	c.reply(chatID, fmt.Sprintf(
 		"🎯 *AUTO-BUY TRIGGERED*\nToken: `%s`%s\nAmount: %s ETH\nGas: %s gwei",
-		tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, formatGwei(gasPrice)))
+		tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, helpers.WeiToGwei(gasPrice)))
 
 	// Execute the swap
 	txHash, err := c.executeBuyTransaction(ctx, tokenToBuy, buyAmount, gasPrice)
@@ -1281,7 +1282,7 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 	c.trackPosition(tokenToBuy, buyAmount, txHash)
 
 	telemetry.Infof("[autobuy] SUCCESS - token: %s, amount: %s ETH, tx: %s",
-		tokenToBuy.Hex(), formatEth(buyAmount), txHash.Hex())
+		tokenToBuy.Hex(), helpers.FormatEth(buyAmount), txHash.Hex())
 }
 
 // Execute the actual swap transaction
@@ -1404,7 +1405,7 @@ func (c *Controller) executeBuyWithBundle(ctx context.Context, token common.Addr
 	}
 
 	// Parse bribe amount
-	bribe, _ := parseEthAmount(c.bribeAmount)
+	bribe, _ := helpers.EthToWei(c.bribeAmount)
 
 	// Create bundle with optional bribe
 	bundle, err := c.bundler.CreateSniperBundle(ctx, signedTx, bribe)
@@ -1620,7 +1621,7 @@ func (c *Controller) executeBuy(token common.Address, ethAmount *big.Int) (commo
 	}
 
 	telemetry.Infof("[buy] sent tx: %s for token %s with %s ETH",
-		signedTx.Hash().Hex(), token.Hex(), formatEth(ethAmount))
+		signedTx.Hash().Hex(), token.Hex(), helpers.FormatEth(ethAmount))
 
 	return signedTx.Hash(), nil
 }
@@ -1750,56 +1751,6 @@ func (c *Controller) executeSell(token common.Address, amount *big.Int) (common.
 
 // ============ Helper Functions ============
 
-// parseEthAmount converts user input like "0.1" to wei
-func parseEthAmount(input string) (*big.Int, error) {
-	if input == "" {
-		return nil, fmt.Errorf("empty amount")
-	}
-
-	// Remove any "ETH" suffix if present
-	input = strings.TrimSuffix(strings.ToLower(input), "eth")
-	input = strings.TrimSpace(input)
-
-	// Parse as float
-	amount, err := strconv.ParseFloat(input, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid amount: %s", input)
-	}
-
-	if amount <= 0 {
-		return nil, fmt.Errorf("amount must be positive")
-	}
-
-	// Convert to wei (multiply by 10^18)
-	wei := new(big.Float).SetFloat64(amount)
-	wei.Mul(wei, big.NewFloat(1e18))
-
-	// Convert to big.Int
-	result := new(big.Int)
-	wei.Int(result)
-
-	return result, nil
-}
-func formatEth(wei *big.Int) string {
-	if wei == nil {
-		return "0"
-	}
-	// Convert wei to ETH (divide by 10^18)
-	ethValue := new(big.Float).SetInt(wei)
-	ethValue.Quo(ethValue, big.NewFloat(1e18))
-
-	// Format with precision
-	f, _ := ethValue.Float64()
-	if f < 0.0001 {
-		return fmt.Sprintf("%.8f", f)
-	} else if f < 1 {
-		return fmt.Sprintf("%.6f", f)
-	} else if f < 100 {
-		return fmt.Sprintf("%.4f", f)
-	}
-	return fmt.Sprintf("%.2f", f)
-}
-
 // parseGweiToWei converts gwei string to wei
 func parseGweiToWei(gweiStr string) *big.Int {
 	if gweiStr == "" {
@@ -1825,17 +1776,6 @@ func parseGweiToWei(gweiStr string) *big.Int {
 	return new(big.Int).Mul(gwei, big.NewInt(1000000000))
 }
 
-// formatGwei converts wei to gwei string
-func formatGwei(wei *big.Int) string {
-	if wei == nil {
-		return "0"
-	}
-
-	// Convert wei to gwei
-	gwei := new(big.Int).Div(wei, big.NewInt(1000000000))
-	return gwei.String()
-}
-
 // parsePercentage converts "50" or "50%" to integer 50
 func parsePercentage(input string) (int, error) {
 	input = strings.TrimSuffix(input, "%")
@@ -1854,18 +1794,6 @@ func parsePercentage(input string) (int, error) {
 
 // helper so we can flip to true with a function (avoids shadow warning)
 func True() bool { return true }
-
-func wei(s string) *big.Int {
-	// naive decimal parser for small constants; or just use big.NewInt for hardcoded values
-	f, ok := new(big.Float).SetString(s)
-	if !ok {
-		return big.NewInt(0)
-	}
-	ethWei := new(big.Float).Mul(f, big.NewFloat(1e18))
-	out := new(big.Int)
-	ethWei.Int(out)
-	return out
-}
 
 // getTokenBalance retrieves ERC20 token balance for wallet
 func (c *Controller) getTokenBalance(token common.Address) (*big.Int, error) {
