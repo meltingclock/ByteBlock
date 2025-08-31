@@ -572,3 +572,7 @@ const ERC20_ABI = `[
 		"type": "function"
 	}
 ]`
+
+func (te *TradeExecutor) GetWalletAddress() common.Address {
+	return te.walletAddr
+}

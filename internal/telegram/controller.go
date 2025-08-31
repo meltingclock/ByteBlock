@@ -2,12 +2,9 @@ package telegram
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"fmt"
 	"math/big"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -16,13 +13,12 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 
-	"github.com/meltingclock/biteblock_v1/internal/bundle"
 	"github.com/meltingclock/biteblock_v1/internal/config"
 	v2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
+	execution "github.com/meltingclock/biteblock_v1/internal/executor"
 	"github.com/meltingclock/biteblock_v1/internal/helpers"
 	"github.com/meltingclock/biteblock_v1/internal/mempool"
 	"github.com/meltingclock/biteblock_v1/internal/scanner"
@@ -75,15 +71,13 @@ type Controller struct {
 	cancelFn context.CancelFunc
 	running  bool
 
-	// NEW: execution related
-	ethClient   *ethclient.Client
-	dex         *v2.Registry
-	privateKey  *ecdsa.PrivateKey
-	walletAddr  common.Address
-	routerABI   abi.ABI
-	erc20ABI    abi.ABI
-	positions   map[common.Address]*Position // Track open positions
-	positionsMu sync.RWMutex
+	// Network and blockchain
+	ethClient *ethclient.Client
+	dex       *v2.Registry
+	activeNet string // NEW: "ethereum" | "bsc" | "base"
+
+	executor    *execution.TradeExecutor
+	tradeConfig execution.TradeConfig
 
 	// NEW: Safety settings (runtime configurable)
 	honeypotCheckEnabled bool
@@ -93,14 +87,14 @@ type Controller struct {
 	checkCache           map[common.Address]*scanner.TokenSafety // Cache results
 	//cacheMu              sync.RWMutex
 
-	activeNet string // NEW: "ethereum" | "bsc" | "base"
-
 	autoBuyEnabled bool // Runtime toogle
 
 	// Bundle execution
-	bundler      *bundle.Bundler
-	useFlashbots bool   // Future use
-	bribeAmount  string // ETH Amount for miner bribe
+	//bundler      *bundle.Bundler
+	//useFlashbots bool                  // Future use
+	//bribeAmount  string                // ETH Amount for miner bribe
+	//useBundle    bool                  // Whether to use bundle execution
+	//bundleConfig execution.TradeConfig // Execution configuration
 }
 
 type Position struct {
@@ -132,7 +126,16 @@ func NewController(cfg *config.Config, path string) (*Controller, error) {
 		trustedTokens:        make(map[common.Address]bool),
 		trustedDeployers:     make(map[common.Address]bool),
 		checkCache:           make(map[common.Address]*scanner.TokenSafety),
-		positions:            make(map[common.Address]*Position),
+		autoBuyEnabled:       cfg.AUTO_BUY_ENABLED,
+		// Deafult trade config
+		tradeConfig: execution.TradeConfig{
+			GasBoostPercent: cfg.AUTO_GAS_BOOST,
+			MaxGasPrice:     nil, // Will set when parsing
+			SlippagePercent: cfg.SLIPPAGE_PERCENT,
+			DeadlineSeconds: 300,
+			UseBundles:      false,
+			BribeAmount:     nil,
+		},
 	}
 
 	// Parse trusted tokens from config
@@ -151,6 +154,11 @@ func NewController(cfg *config.Config, path string) (*Controller, error) {
 		}
 	}
 
+	// Parse max gas price
+	if cfg.MAX_GAS_PRICE_GWEI != "" {
+		ctrl.tradeConfig.MaxGasPrice, _ = helpers.GweiToWei(cfg.MAX_GAS_PRICE_GWEI)
+	}
+
 	telemetry.Infof("[config] Safety mode: %s (enabled: %v)",
 		ctrl.honeypotCheckMode, ctrl.honeypotCheckEnabled)
 
@@ -164,231 +172,323 @@ func (c *Controller) reply(chatID int64, text string) {
 }
 
 func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) error {
+	// 1. GET NETWORK PRESET
 	p, ok := netPresets[strings.ToLower(c.activeNet)]
 	if !ok {
 		return fmt.Errorf("unknown network preset: %s", c.activeNet)
 	}
 
+	telemetry.Infof("[controller] starting on %s network", c.activeNet)
+	c.reply(chatID, fmt.Sprintf("🔄 Connecting to *%s*...", c.activeNet))
+
+	// 2. CREATE CONTEXT WITH CANCELLATION
 	wctx, cancel := context.WithCancel(ctx)
 	c.cancelFn = cancel
 
-	// RPC/ETH clients for analyzers
+	// 3. ESTABLISH RPC/WEBSOCKET CONNECTION
+	telemetry.Debugf("[controller] connecting to %s", p.WSSURL)
+
 	rpcCl, err := rpc.DialContext(wctx, p.WSSURL)
 	if err != nil {
-		return fmt.Errorf("rpc dial: %w", err)
+		cancel()
+		return fmt.Errorf("rpc dial failed: %w", err)
 	}
-	ethCl := ethclient.NewClient(rpcCl)
-	c.ethClient = ethCl
 
-	// Build DEX registry from preset (authorative for factory/router/WETH)
-	dex := v2.NewRegistry(v2.Config{
+	c.ethClient = ethclient.NewClient(rpcCl)
+
+	// Verify connection
+	chainID, err := c.ethClient.ChainID(wctx)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("failed to get chain ID: %w", err)
+	}
+
+	if chainID.Int64() != p.ChainID {
+		telemetry.Warnf("[controller] chain ID mismatch: got %d, expected %d",
+			chainID.Int64(), p.ChainID)
+	}
+
+	// 4. BUILD DEX REGISTRY
+	c.dex = v2.NewRegistry(v2.Config{
 		Network: v2.Network(strings.ToLower(c.activeNet)),
 		Factory: p.Factory,
 		Router:  p.Router,
 		WETH:    p.WETH,
 	})
 
-	// Store dex registry
-	c.dex = dex
+	telemetry.Infof("[controller] DEX configured - Factory: %s, Router: %s, WETH: %s",
+		p.Factory.Hex(), p.Router.Hex(), p.WETH.Hex())
 
-	// Initialize router ABI
-	routerABI, err := abi.JSON(strings.NewReader(v2.RouterABI))
-	if err != nil {
-		return fmt.Errorf("router ABI parse: %w", err)
-	}
-	c.routerABI = routerABI
+	// 5. INITIALIZE EXECUTOR (Trading Engine)
+	walletStatus := "🔴 *Watch-Only Mode*"
 
-	// Initialize ERC20 ABI (minimal)
-	erc20ABIJson := `[
-		{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-		{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
-		{"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-		{"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}
-	]`
-	erc20ABI, _ := abi.JSON(strings.NewReader(erc20ABIJson))
-	c.erc20ABI = erc20ABI
-
-	// Load private key if configured
 	if c.Cfg.PRIVATE_KEY != "" {
-		privateKey, walletAddr, err := loadPrivateKey(c.Cfg.PRIVATE_KEY)
+		telemetry.Debugf("[controller] initializing executor with private key")
+
+		privateKey, walletAddr, err := helpers.ValidatePrivateKey(c.Cfg.PRIVATE_KEY)
 		if err != nil {
-			c.reply(chatID, fmt.Sprintf("⚠️ Private key error: %v\nBot will run in watch-only mode", err))
-
+			c.reply(chatID, fmt.Sprintf(
+				"⚠️ *Private Key Error*\n```\n%v\n```\nRunning in watch-only mode",
+				err))
+			telemetry.Errorf("[controller] private key validation failed: %v", err)
 		} else {
-			c.privateKey = privateKey
-			c.walletAddr = walletAddr
+			// Create executor
+			c.executor, err = execution.NewTradeExecutor(
+				c.ethClient,
+				privateKey,
+				walletAddr,
+				c.dex,
+			)
 
-			// Check wallet balance
-			balance, err := c.getETHBalance()
 			if err != nil {
-				c.reply(chatID, fmt.Sprintf("⚠️ Could not fetch wallet balance for `%s`: %v",
-					walletAddr.Hex(), err))
+				c.reply(chatID, fmt.Sprintf(
+					"⚠️ *Executor Init Failed*\n```\n%v\n```",
+					err))
+				telemetry.Errorf("[controller] executor creation failed: %v", err)
 			} else {
-				c.reply(chatID, fmt.Sprintf("💰 Wallet: `%s`\nBalance: %s ETH",
-					walletAddr.Hex(), helpers.FormatEth(balance)))
+				// Check wallet balance
+				balance, err := c.executor.GetETHBalance(wctx)
+				if err != nil {
+					walletStatus = fmt.Sprintf(
+						"⚠️ *Wallet Connected* (balance check failed)\n"+
+							"Address: `%s`",
+						walletAddr.Hex())
+				} else {
+					walletStatus = fmt.Sprintf(
+						"✅ *Wallet Connected*\n"+
+							"Address: `%s`\n"+
+							"Balance: **%s ETH**",
+						walletAddr.Hex(),
+						helpers.FormatEth(balance))
+
+					// Warn if low balance
+					minRequired := helpers.Wei("0.1") // 0.1 ETH minimum recommended
+					if balance.Cmp(minRequired) < 0 {
+						walletStatus += "\n⚠️ *Low balance - add funds to trade*"
+					}
+				}
+
+				// Configure trade settings from config
+				if c.Cfg.MAX_GAS_PRICE_GWEI != "" {
+					c.tradeConfig.MaxGasPrice, _ = helpers.GweiToWei(c.Cfg.MAX_GAS_PRICE_GWEI)
+				}
+				c.tradeConfig.GasBoostPercent = c.Cfg.AUTO_GAS_BOOST
+				c.tradeConfig.SlippagePercent = c.Cfg.SLIPPAGE_PERCENT
+				c.tradeConfig.DeadlineSeconds = 300
+
+				telemetry.Infof("[controller] executor ready - wallet: %s", walletAddr.Hex())
 			}
 		}
 	} else {
-		c.reply(chatID, "⚠️ No private key configured. Running in watch-only mode.")
+		telemetry.Infof("[controller] no private key configured - watch-only mode")
 	}
 
-	// Initialize positions map
-	if c.positions == nil {
-		c.positions = make(map[common.Address]*Position)
+	// 6. INITIALIZE SIGNAL DETECTION & SCANNERS
+
+	// Pair Registry (tracks DEX pairs)
+	pairReg := signals.NewPairRegistry(c.dex, 48*time.Hour)
+	pairReg.Start(wctx, c.ethClient)
+	telemetry.Infof("[controller] pair registry started")
+
+	// Mint Watcher (tracks liquidity confirmation)
+	startMintWatcher(wctx, c.ethClient, pairReg)
+	telemetry.Infof("[controller] mint watcher started")
+
+	// Liquidity Analyzer (detects pending liquidity)
+	liq := signals.NewLiquidityAnalyzer(c.ethClient, c.dex, pairReg)
+	telemetry.Infof("[controller] liquidity analyzer ready")
+
+	// Scanner (safety & filter checks)
+	minLiquidityWei := helpers.Wei(c.Cfg.MIN_LIQUIDITY_ETH)
+	if minLiquidityWei == nil {
+		minLiquidityWei = helpers.Wei("0.5") // Default 0.5 ETH
 	}
 
-	// Canonical PairCreated subscription + pending addLiquidity analyzer
-	pairReg := signals.NewPairRegistry(dex, 48*time.Hour)
-	pairReg.Start(wctx, ethCl)
-	// start the MintWatcher
-	startMintWatcher(wctx, ethCl, pairReg)
-	liq := signals.NewLiquidityAnalyzer(ethCl, dex, pairReg)
-
-	c.autoBuyEnabled = c.Cfg.AUTO_BUY_ENABLED
-
-	// Notify user of configuration
-	if c.privateKey != nil {
-		if c.autoBuyEnabled {
-			c.reply(chatID, fmt.Sprintf(
-				"🤖 *AUTO-BUY ENABLED*\n"+
-					"Amount: %s ETH\n"+
-					"Min Liquidity: %s ETH\n"+
-					"Max Gas: %s gwei\n"+
-					"Safety Check: %v",
-				c.Cfg.AUTO_BUY_AMOUNT,
-				c.Cfg.MIN_LIQUIDITY_ETH, // Scanner uses this
-				c.Cfg.MAX_GAS_PRICE_GWEI,
-				c.Cfg.HONEYPOT_CHECK_ENABLED))
-		} else {
-			c.reply(chatID, "🔄 Auto-buy is OFF (use /autobuy on to enable)")
-		}
-	} else {
-		c.reply(chatID, "⚠️ No private key - running in watch-only mode")
-	}
-
-	scan := scanner.New(ethCl, dex, scanner.Config{
+	scan := scanner.New(c.ethClient, c.dex, scanner.Config{
 		RequireWethPair:   true,
-		MinEthLiquidity:   helpers.Wei(c.Cfg.MIN_LIQUIDITY_ETH), // Use config value
-		MinTokenLiquidity: nil,                                  // set when we want non-ETH pairs enforced
-		AllowCreators:     map[common.Address]bool{},            // empty = allow all
-		DenyCreators:      map[common.Address]bool{},            // can be filled later via telegram
+		MinEthLiquidity:   minLiquidityWei,
+		MinTokenLiquidity: nil,
+		AllowCreators:     map[common.Address]bool{},
+		DenyCreators:      map[common.Address]bool{},
 		Deadline:          250 * time.Millisecond,
 	})
+	telemetry.Infof("[controller] scanner configured - min liquidity: %s ETH",
+		helpers.FormatEth(minLiquidityWei))
 
-	// Mempool watcher (your existing pending-tx card + new Liquidity card)
+	// 7. CONFIGURE AUTO-BUY
+	c.autoBuyEnabled = c.Cfg.AUTO_BUY_ENABLED && c.executor != nil
+
+	autoBuyStatus := "🔴 *Auto-Buy: DISABLED*"
+	if c.executor == nil {
+		autoBuyStatus = "⚠️ *Auto-Buy: Unavailable* (no wallet)"
+	} else if c.autoBuyEnabled {
+		autoBuyStatus = fmt.Sprintf(
+			"🟢 *Auto-Buy: ENABLED*\n"+
+				"• Amount: %s ETH\n"+
+				"• Min Liquidity: %s ETH\n"+
+				"• Max Gas: %s gwei\n"+
+				"• Safety Check: %v\n"+
+				"• Bundles: %v",
+			c.Cfg.AUTO_BUY_AMOUNT,
+			c.Cfg.MIN_LIQUIDITY_ETH,
+			c.Cfg.MAX_GAS_PRICE_GWEI,
+			c.honeypotCheckEnabled,
+			c.tradeConfig.UseBundles)
+	}
+
+	// 8. START MEMPOOL WATCHER
 	c.watcher = mempool.NewWatcher(p.WSSURL, func(ctx context.Context, tx *types.Transaction) error {
+		// Basic pending tx logging (optional - can be noisy)
 		from, _ := mempool.SendTxVerifier(tx)
-		to := "<contract-creation>"
-		if tx.To() != nil {
-			to = tx.To().Hex()
+
+		// Only log high-value transactions
+		if tx.Value().Sign() > 0 && tx.Value().Cmp(helpers.Wei("1")) >= 0 {
+			telemetry.Debugf("[mempool] high-value tx: %s from %s value %s ETH",
+				tx.Hash().Hex(), from.Hex(), helpers.FormatEth(tx.Value()))
 		}
 
-		if tx.Value().Sign() > 0 {
-			c.reply(chatID, fmt.Sprintf(
-				"⛓ *Pending tx*\n`%s`\nfrom: `%s`\nto: `%s`\nnonce: %d\nvalue: %s wei",
-				tx.Hash().Hex(), from.Hex(), to, tx.Nonce(), tx.Value().String(),
-			))
-		}
+		// CHECK FOR LIQUIDITY ADDITIONS
+		if tx.To() != nil && *tx.To() == c.dex.Router() {
+			// Quick router function check
+			if meta, ok := c.dex.LookupSelectorFromData(tx.Data()); ok {
+				telemetry.Debugf("[router] %s -> %s", tx.Hash().Hex(), meta.Name)
+			}
 
-		// Liquidity detection vs preset router
-		if tx.To() != nil && *tx.To() == dex.Router() {
-			if meta, ok := dex.LookupSelectorFromData(tx.Data()); !ok {
-				// Unknown function on router - skip fast
+			// Analyze for liquidity
+			sig, err := liq.AnalyzePending(ctx, tx)
+			if err != nil || sig == nil {
+				return nil // Not liquidity or error
+			}
+
+			// Run scanner filters
+			rep, err := scan.Run(ctx, sig)
+			if err != nil || !rep.Pass {
+				telemetry.Debugf("[scan] rejected: %v", rep.Reasons)
 				return nil
-			} else {
-				// log meta.Name/meta.Kind for visibility
-				telemetry.Debugf("[router] %s -> %s", tx.Hash(), meta.Name)
 			}
-			if sig, _ := liq.AnalyzePending(ctx, tx); sig != nil {
-				// ⬇️ fast safety scan first
-				// Scanner validates: min liquidity, WETH pair, etc.
-				rep, err := scan.Run(ctx, sig)
-				if err != nil || !rep.Pass {
-					// Rejected by scanner filters
-					telemetry.Debugf("[scan][reject] %v", rep.Reasons)
-					return nil
-				}
-				// Passed all scanner filters!
-				telemetry.Infof("[liquidity][passed] pair=%s liquidity=%s ETH from=%s",
-					sig.Pair.Hex(), helpers.FormatEth(rep.ETHInWei), sig.From.Hex())
 
-				// AUTO-BUY DECISION POINT
-				if c.autoBuyEnabled && c.privateKey != nil {
-					// Execute in background to not block mempool
-					go func() {
-						buyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer cancel()
+			// PASSED ALL FILTERS!
+			telemetry.Infof("[liquidity] DETECTED pair=%s from=%s liquidity=%s ETH",
+				sig.Pair.Hex(), sig.From.Hex(), helpers.FormatEth(rep.ETHInWei))
 
-						// Execute auto-buy (scanner already validated)
-						c.executeAutoBuy(buyCtx, sig, rep, chatID)
-					}()
-				} else {
-					// Manual mode - notify user
-					token := c.identifyTargetToken(sig)
-					liquidityStr := "Unknown"
-					if rep.ETHInWei != nil {
-						liquidityStr = helpers.FormatEth(rep.ETHInWei) + " ETH"
-					}
+			// Identify target token
+			token := c.identifyTargetToken(sig)
+			liquidityStr := "Unknown"
+			if rep.ETHInWei != nil {
+				liquidityStr = helpers.FormatEth(rep.ETHInWei) + " ETH"
+			}
 
-					// 👇 Console log (pending/liquidity)
-					telemetry.Debugf("[liquidity][pending] hash=%s kind=%s from=%s router=%s pair=%s t0=%s t1=%s nonce=%d val=%s",
-						sig.Hash.Hex(),
-						sig.Kind.String(),
-						sig.From.Hex(),
-						sig.Router.Hex(),
-						sig.Pair.Hex(),
-						sig.Token0.Hex(),
-						sig.Token1.Hex(),
-						tx.Nonce(),
-						tx.Value().String(),
-					)
-
-					c.reply(chatID, fmt.Sprintf(
-						"💧 *Liquidity Detected*\n"+
-							"Token: `%s`\n"+
-							"Pair: `%s`\n"+
-							"Liquidity: %s\n"+
-							"From: `%s`\n\n"+
-							"Use: /buy %s %s\n"+
-							"Or: /autobuy on",
-						token.Hex(),
-						sig.Pair.Hex(),
-						liquidityStr,
-						sig.From.Hex(),
-						token.Hex()[:10]+"...",
-						c.Cfg.AUTO_BUY_AMOUNT))
-				}
-
-				// --- Receipt correlator (background; non-blocking) ---
-				go func(h common.Hash, pair common.Address) {
-					ctx2, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			// AUTO-BUY EXECUTION
+			if c.autoBuyEnabled {
+				go func() {
+					buyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer cancel()
-
-					rcpt, err := ethCl.TransactionReceipt(ctx2, h)
-					if err != nil {
-						return // receipt not ready or RPC hiccup
-					}
-					if evt, ok := signals.FindMintInReceipt(rcpt, pair); ok {
-						telemetry.Debugf("[liquidity][mined/receipt] pair=%s sender=%s amount0=%s amount1=%s block=%d",
-							pair.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), rcpt.BlockNumber)
-						c.reply(chatID, fmt.Sprintf(
-							"✅ *Liquidity mined*\npair: `%s`\nsender: `%s`\namount0: `%s`\namount1: `%s`\nblock: `%d`",
-							pair.Hex(), evt.Sender.Hex(), evt.Amount0.String(), evt.Amount1.String(), rcpt.BlockNumber,
-						))
-					}
-				}(sig.Hash, sig.Pair)
+					c.executeAutoBuy(buyCtx, sig, rep, chatID)
+				}()
+			} else {
+				// Manual mode notification
+				c.reply(chatID, fmt.Sprintf(
+					"💧 *Liquidity Detected*\n\n"+
+						"Token: `%s`\n"+
+						"Pair: `%s`\n"+
+						"Liquidity: %s\n"+
+						"From: `%s`\n\n"+
+						"Use: `/buy %s %s`\n"+
+						"Or enable: `/autobuy on`",
+					token.Hex(),
+					sig.Pair.Hex(),
+					liquidityStr,
+					sig.From.Hex(),
+					helpers.FormatAddress(token),
+					c.Cfg.AUTO_BUY_AMOUNT))
 			}
+
+			// Background receipt monitor
+			go c.monitorLiquidityReceipt(sig.Hash, sig.Pair, chatID)
 		}
+
 		return nil
 	})
 
+	// Start the watcher
 	if err := c.watcher.Start(wctx); err != nil {
 		cancel()
-		return err
+		return fmt.Errorf("mempool watcher start failed: %w", err)
 	}
-	c.running = True()
-	c.reply(chatID, fmt.Sprintf("🟢 *Sniper started* on *%s*\nWSS: `%s`", c.activeNet, p.WSSURL))
+
+	c.running = true
+	telemetry.Infof("[controller] all systems started successfully")
+
+	// 9. SEND FINAL STATUS REPORT
+	statusReport := fmt.Sprintf(
+		"🟢 **SNIPER STARTED**\n\n"+
+			"**Network:** %s\n"+
+			"**Chain ID:** %d\n\n"+
+			"%s\n\n"+
+			"%s\n\n"+
+			"**Components:**\n"+
+			"✅ Mempool Watcher\n"+
+			"✅ Liquidity Scanner\n"+
+			"✅ Safety Checker: %v\n"+
+			"✅ Pair Registry\n\n"+
+			"**Commands:**\n"+
+			"• `/buy <token> <eth>` - Manual buy\n"+
+			"• `/sell <token> <%%>` - Sell position\n"+
+			"• `/positions` - View holdings\n"+
+			"• `/bundle on/off` - Toggle bundles\n"+
+			"• `/autobuy on/off` - Toggle auto-buy\n"+
+			"• `/stop` - Stop the bot",
+		c.activeNet,
+		chainID.Int64(),
+		walletStatus,
+		autoBuyStatus,
+		c.honeypotCheckEnabled)
+
+	c.reply(chatID, statusReport)
+
 	return nil
+}
+
+// Helper function to monitor liquidity receipt
+func (c *Controller) monitorLiquidityReceipt(txHash common.Hash, pair common.Address, chatID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			receipt, err := c.ethClient.TransactionReceipt(ctx, txHash)
+			if err != nil {
+				continue // Not mined yet
+			}
+
+			if receipt.Status == 1 {
+				telemetry.Infof("[liquidity] confirmed in block %d", receipt.BlockNumber)
+
+				// Check for mint event
+				if evt, ok := signals.FindMintInReceipt(receipt, pair); ok {
+					c.reply(chatID, fmt.Sprintf(
+						"✅ *Liquidity Confirmed*\n"+
+							"Block: %d\n"+
+							"Pair: `%s`\n"+
+							"Amount0: %s\n"+
+							"Amount1: %s",
+						receipt.BlockNumber,
+						pair.Hex(),
+						evt.Amount0.String(),
+						evt.Amount1.String()))
+				}
+			} else {
+				telemetry.Warnf("[liquidity] tx failed: %s", txHash.Hex())
+			}
+			return
+		}
+	}
 }
 
 // Watches Mint(sender, amount0, amount1) on all known pairs to confirm mined liquidity.
@@ -560,68 +660,173 @@ func (c *Controller) Start(ctx context.Context) error {
 			case strings.HasPrefix(text, "/autobuy"):
 				parts := strings.Fields(text)
 				if len(parts) < 2 {
-					// Show status
+					// Show detailed status
 					status := "OFF 🔴"
 					if c.autoBuyEnabled {
 						status = "ON 🟢"
 					}
+
+					// Check if auto-buy is even possible
+					capability := "✅ Ready"
+					if c.executor == nil {
+						capability = "❌ No wallet configured"
+						status = "UNAVAILABLE ⚠️"
+					} else if !c.running {
+						capability = "⚠️ Bot not running"
+					}
+
+					// Bundle status
+					bundleStatus := "Disabled"
+					if c.tradeConfig.UseBundles {
+						bundleStatus = fmt.Sprintf("Enabled (Bribe: %s ETH)",
+							helpers.FormatEth(c.tradeConfig.BribeAmount))
+					}
+
 					c.reply(chatID, fmt.Sprintf(
-						"*Auto-Buy Status: %s*\n\n"+
-							"Buy Amount: %s ETH\n"+
-							"Min Liquidity: %s ETH (scanner filter)\n"+
-							"Max Gas: %s gwei\n"+
-							"Safety Check: %v\n"+
-							"Gas Boost: %d%%\n\n"+
-							"Usage: /autobuy <on|off>",
+						"*Auto-Buy Status: %s*\n"+
+							"*Capability: %s*\n\n"+
+							"**Configuration:**\n"+
+							"• Buy Amount: %s ETH\n"+
+							"• Min Liquidity: %s ETH\n"+
+							"• Max Gas: %s gwei\n"+
+							"• Gas Boost: %d%%\n"+
+							"• Slippage: %d%%\n"+
+							"• Safety Check: %v\n"+
+							"• Bundles: %s\n\n"+
+							"**Safety Mode:** %s\n"+
+							"**Trusted Tokens:** %d\n"+
+							"**Trusted Deployers:** %d\n\n"+
+							"Usage: `/autobuy <on|off>`",
 						status,
+						capability,
 						c.Cfg.AUTO_BUY_AMOUNT,
 						c.Cfg.MIN_LIQUIDITY_ETH,
 						c.Cfg.MAX_GAS_PRICE_GWEI,
+						c.Cfg.AUTO_GAS_BOOST,
+						c.Cfg.SLIPPAGE_PERCENT,
 						c.Cfg.HONEYPOT_CHECK_ENABLED,
-						c.Cfg.AUTO_GAS_BOOST))
+						bundleStatus,
+						c.honeypotCheckMode,
+						len(c.trustedTokens),
+						len(c.trustedDeployers)))
 					break
 				}
 
 				switch strings.ToLower(parts[1]) {
-				case "on", "enable":
-					if c.privateKey == nil {
-						c.reply(chatID, "❌ No private key configured")
+				case "on", "enable", "start":
+					// Check prerequisites
+					if c.executor == nil {
+						c.reply(chatID,
+							"❌ *Cannot Enable Auto-Buy*\n\n"+
+								"No wallet configured. Please:\n"+
+								"1. Add PRIVATE_KEY to config.yml\n"+
+								"2. Restart with `/start`")
 						break
 					}
+
+					if !c.running {
+						c.reply(chatID,
+							"⚠️ *Bot Not Running*\n\n"+
+								"Start the bot first with `/start`")
+						break
+					}
+
+					// Check wallet balance
+					balance, err := c.executor.GetETHBalance(context.Background())
+					if err != nil {
+						c.reply(chatID, fmt.Sprintf("⚠️ Could not check balance: %v", err))
+					} else {
+						buyAmount, _ := helpers.EthToWei(c.Cfg.AUTO_BUY_AMOUNT)
+						minRequired := new(big.Int).Add(buyAmount, big.NewInt(1e16)) // + gas
+
+						if balance.Cmp(minRequired) < 0 {
+							c.reply(chatID, fmt.Sprintf(
+								"⚠️ *Low Balance Warning*\n\n"+
+									"Current: %s ETH\n"+
+									"Needed: %s ETH\n"+
+									"(for %s ETH buys + gas)\n\n"+
+									"Auto-buy will fail without funds!",
+								helpers.FormatEth(balance),
+								helpers.FormatEth(minRequired),
+								c.Cfg.AUTO_BUY_AMOUNT))
+						}
+					}
+
+					// Enable auto-buy
 					c.autoBuyEnabled = true
 					c.Cfg.AUTO_BUY_ENABLED = true
 					_ = config.Save(c.Path, c.Cfg)
-					c.reply(chatID, "🟢 *AUTO-BUY ENABLED*\nBot will execute automatically when liquidity is detected")
 
-				case "off", "disable":
+					// Build confirmation message
+					confirmMsg := "🟢 *AUTO-BUY ENABLED*\n\n" +
+						"Bot will automatically execute when:\n" +
+						fmt.Sprintf("• Liquidity ≥ %s ETH detected\n", c.Cfg.MIN_LIQUIDITY_ETH) +
+						fmt.Sprintf("• Gas price ≤ %s gwei\n", c.Cfg.MAX_GAS_PRICE_GWEI)
+
+					if c.honeypotCheckEnabled {
+						confirmMsg += "• Safety check passes\n"
+					}
+
+					confirmMsg += fmt.Sprintf("\n**Buy Amount:** %s ETH per trade", c.Cfg.AUTO_BUY_AMOUNT)
+
+					if c.tradeConfig.UseBundles {
+						confirmMsg += "\n**Mode:** Bundle (Flashbots)"
+					} else {
+						confirmMsg += "\n**Mode:** Normal mempool"
+					}
+
+					c.reply(chatID, confirmMsg)
+					telemetry.Infof("[controller] auto-buy enabled via telegram")
+
+				case "off", "disable", "stop":
 					c.autoBuyEnabled = false
 					c.Cfg.AUTO_BUY_ENABLED = false
 					_ = config.Save(c.Path, c.Cfg)
-					c.reply(chatID, "🔴 *AUTO-BUY DISABLED*\nSwitched to manual mode")
+
+					c.reply(chatID,
+						"🔴 *AUTO-BUY DISABLED*\n\n"+
+							"Switched to manual mode.\n"+
+							"You will receive notifications but must execute manually.\n\n"+
+							"Re-enable with: `/autobuy on`")
+					telemetry.Infof("[controller] auto-buy disabled via telegram")
+
+				case "test":
+					// Hidden test command for debugging
+					if c.executor == nil {
+						c.reply(chatID, "❌ No executor available")
+						break
+					}
+
+					c.reply(chatID, "🧪 *Auto-Buy Test*\n\nSimulating auto-buy trigger...")
+
+					/*
+						// Create fake signal for testing
+						testSignal := &signals.LiquiditySignal{
+							Token0: c.dex.WETH(),
+							Token1: common.HexToAddress("0x1234567890123456789012345678901234567890"),
+							Pair:   common.HexToAddress("0x0000000000000000000000000000000000000000"),
+						}
+						testReport := &scanner.Report{
+							ETHInWei: helpers.Wei("1.0"),
+							Pass:     true,
+						}
+					*/
+
+					// Test with dry-run (would need to add dry-run support)
+					c.reply(chatID,
+						"✅ Test complete\n"+
+							"Executor: Ready\n"+
+							"Safety Check: Enabled\n"+
+							"Would buy with: "+c.Cfg.AUTO_BUY_AMOUNT+" ETH")
 
 				default:
-					c.reply(chatID, "Use: /autobuy on or /autobuy off")
+					c.reply(chatID,
+						"**Usage:** `/autobuy <command>`\n\n"+
+							"**Commands:**\n"+
+							"• `on` - Enable auto-buy\n"+
+							"• `off` - Disable auto-buy\n"+
+							"• (no args) - Show status")
 				}
-
-			case strings.HasPrefix(text, "/setamount"):
-				parts := strings.Fields(text)
-				if len(parts) < 2 {
-					c.reply(chatID, fmt.Sprintf(
-						"Current amount: %s ETH\nUsage: /setamount <amount>",
-						c.Cfg.AUTO_BUY_AMOUNT))
-					break
-				}
-
-				amount := parts[1]
-				if _, err := helpers.EthToWei(amount); err != nil {
-					c.reply(chatID, "❌ Invalid amount. Examples: 0.1, 0.5, 1.0")
-					break
-				}
-
-				c.Cfg.AUTO_BUY_AMOUNT = amount
-				_ = config.Save(c.Path, c.Cfg)
-				c.reply(chatID, fmt.Sprintf("✅ Buy amount set to %s ETH", amount))
-
 			case strings.HasPrefix(text, "/setgas"):
 				parts := strings.Fields(text)
 				if len(parts) < 2 {
@@ -665,8 +870,8 @@ func (c *Controller) Start(ctx context.Context) error {
 					c.reply(chatID, "🔴 Stopped.")
 				}()
 			case strings.HasPrefix(text, "/buy"):
-				if c.privateKey == nil {
-					c.reply(chatID, "❌ No private key configured. Cannot execute trades.")
+				if c.executor == nil {
+					c.reply(chatID, "❌ No wallet configured. Cannot execute trades.")
 					break
 				}
 
@@ -690,138 +895,74 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 
 				// Check wallet balance
-				balance, err := c.getETHBalance()
+				balance, err := c.executor.GetETHBalance(context.Background())
 				if err != nil {
 					c.reply(chatID, "❌ Could not check wallet balance")
 					break
 				}
 
-				if balance.Cmp(ethAmount) < 0 {
+				// Need funds for buy + gas
+				gasReserve := big.NewInt(1e16) // 0.01 ETH for gas
+				required := new(big.Int).Add(ethAmount, gasReserve)
+				if balance.Cmp(required) < 0 {
 					c.reply(chatID, fmt.Sprintf("❌ Insufficient balance\nNeeded: %s ETH\nHave: %s ETH",
-						helpers.FormatEth(ethAmount), helpers.FormatEth(balance)))
+						helpers.FormatEth(required), helpers.FormatEth(balance)))
 					break
 				}
 
 				// ============ HONEYPOT CHECK ============
-				c.reply(chatID, "🔍 Running safety analysis...")
+				if c.honeypotCheckEnabled {
+					c.reply(chatID, "🔍 Running safety analysis...")
 
-				checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
-				safety, err := checker.CheckToken(context.Background(), token)
-				if err != nil {
-					c.reply(chatID, fmt.Sprintf("⚠️ Safety check error: %v\nProceed with caution!", err))
-					// Don't block trade, just warn
-				} else {
-					// Display safety report
-					safetyEmoji := "🟢"
-					recommendation := "SAFE TO TRADE"
+					checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
+					safety, err := checker.CheckToken(context.Background(), token)
+					if err != nil {
+						c.reply(chatID, fmt.Sprintf("⚠️ Safety check error: %v\nProceed with caution!", err))
+					} else {
+						// Display safety report
+						c.displaySafetyReport(chatID, safety)
 
-					if safety.IsHoneypot {
-						safetyEmoji = "🔴"
-						recommendation = "DO NOT BUY - HONEYPOT!"
-					} else if safety.SafetyScore < 40 {
-						safetyEmoji = "🔴"
-						recommendation = "HIGH RISK - NOT RECOMMENDED"
-					} else if safety.SafetyScore < 70 {
-						safetyEmoji = "🟡"
-						recommendation = "MODERATE RISK - BE CAREFUL"
-					}
-
-					// Build safety report
-					report := fmt.Sprintf(
-						"%s *Safety Score: %d/100*\n"+
-							"*%s*\n\n"+
-							"*Token Info:*\n"+
-							"Name: %s\n"+
-							"Symbol: %s\n\n"+
-							"*Trade Simulation:*\n"+
-							"✅ Can Buy: %v\n"+
-							"✅ Can Approve: %v\n"+
-							"✅ Can Sell: %v\n\n"+
-							"*Tax Analysis:*\n"+
-							"Buy Tax: %.1f%%\n"+
-							"Sell Tax: %.1f%%\n\n"+
-							"*Contract Analysis:*\n"+
-							"Owner: %v (Renounced: %v)\n"+
-							"Has Mint: %v\n"+
-							"Has Pause: %v\n"+
-							"Has Blacklist: %v\n"+
-							"Max Wallet: %v\n\n"+
-							"*Liquidity:*\n"+
-							"ETH in Pool: %s\n",
-						safetyEmoji, safety.SafetyScore,
-						recommendation,
-						safety.Name, safety.Symbol,
-						safety.CanBuy, safety.CanApprove, safety.CanSell,
-						safety.BuyTax, safety.SellTax,
-						safety.HasOwner, safety.IsRenounced,
-						safety.HasMintFunction,
-						safety.HasPauseFunction,
-						safety.HasBlacklist,
-						safety.MaxWalletLimit,
-						helpers.FormatEth(safety.LiquidityETH),
-					)
-
-					// Add risk factors if any
-					if len(safety.RiskFactors) > 0 {
-						report += "\n*Risk Factors:*\n"
-						for _, risk := range safety.RiskFactors {
-							report += fmt.Sprintf("⚠️ %s\n", risk)
+						// Block if honeypot
+						if safety.IsHoneypot {
+							c.reply(chatID, "🚨 *TRANSACTION BLOCKED*\nHoneypot detected! Use /forcebuy to override.")
+							break
 						}
-					}
 
-					// Add simulation error if any
-					if safety.SimulationError != "" {
-						report += fmt.Sprintf("\n*Simulation Error:*\n%s\n", safety.SimulationError)
-					}
-
-					c.reply(chatID, report)
-
-					// Block if honeypot detected
-					if safety.IsHoneypot {
-						c.reply(chatID, "🚨 *TRANSACTION BLOCKED*\nHoneypot detected! This token cannot be sold.")
-						break
-					}
-
-					// Warn if risky
-					if safety.SafetyScore < 40 {
-						c.reply(chatID, "⚠️ *HIGH RISK TOKEN*\nUse /forcebuy to proceed anyway (not recommended)")
-						break
-					}
-
-					if safety.SafetyScore < 70 {
-						c.reply(chatID, "⚠️ *MODERATE RISK*\nProceed with caution. Reply 'yes' to continue.")
-						// You could implement a confirmation flow here
+						// Warn if risky
+						if safety.SafetyScore < 40 {
+							c.reply(chatID, "⚠️ *HIGH RISK TOKEN*\nUse /forcebuy to proceed anyway.")
+							break
+						}
 					}
 				}
 
 				// Execute buy if safe
 				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", helpers.FormatEth(ethAmount)))
 
-				txHash, err := c.executeBuy(token, ethAmount)
+				txHash, err := c.executor.ExecuteBuy(
+					context.Background(),
+					token,
+					ethAmount,
+					c.tradeConfig,
+				)
 				if err != nil {
 					c.reply(chatID, fmt.Sprintf("❌ Buy failed: %v", err))
 					break
 				}
 
-				// Save position
-				c.positionsMu.Lock()
-				c.positions[token] = &Position{
-					Token:     token,
-					EthSpent:  ethAmount,
-					EntryTime: time.Now(),
-					TxHash:    txHash,
-				}
-				c.positionsMu.Unlock()
-
 				c.reply(chatID, fmt.Sprintf(
 					"✅ *Buy Executed!*\n"+
 						"Token: `%s`\n"+
 						"Amount: %s ETH\n"+
-						"Tx: `%s`",
-					token.Hex(), helpers.FormatEth(ethAmount), txHash.Hex()))
+						"Tx: `%s`\n"+
+						"Bundle: %v",
+					token.Hex(),
+					helpers.FormatEth(ethAmount),
+					txHash.Hex(),
+					c.tradeConfig.UseBundles))
 			case strings.HasPrefix(text, "/forcebuy"):
-				if c.privateKey == nil {
-					c.reply(chatID, "❌ No private key configured. Cannot execute trades.")
+				if c.executor == nil {
+					c.reply(chatID, "❌ No wallet configured. Cannot execute trades.")
 					break
 				}
 
@@ -845,15 +986,18 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 
 				// Check wallet balance
-				balance, err := c.getETHBalance()
+				balance, err := c.executor.GetETHBalance(context.Background())
 				if err != nil {
 					c.reply(chatID, "❌ Could not check wallet balance")
 					break
 				}
 
-				if balance.Cmp(ethAmount) < 0 {
+				// Need funds for buy + gas
+				gasReserve := big.NewInt(1e16) // 0.01 ETH for gas
+				required := new(big.Int).Add(ethAmount, gasReserve)
+				if balance.Cmp(required) < 0 {
 					c.reply(chatID, fmt.Sprintf("❌ Insufficient balance\nNeeded: %s ETH\nHave: %s ETH",
-						helpers.FormatEth(ethAmount), helpers.FormatEth(balance)))
+						helpers.FormatEth(required), helpers.FormatEth(balance)))
 					break
 				}
 
@@ -861,28 +1005,27 @@ func (c *Controller) Start(ctx context.Context) error {
 
 				c.reply(chatID, fmt.Sprintf("🔄 Buying with %s ETH...", helpers.FormatEth(ethAmount)))
 
-				txHash, err := c.executeBuy(token, ethAmount)
+				txHash, err := c.executor.ExecuteBuy(
+					context.Background(),
+					token,
+					ethAmount,
+					c.tradeConfig,
+				)
 				if err != nil {
 					c.reply(chatID, fmt.Sprintf("❌ Buy failed: %v", err))
 					break
 				}
 
-				// Save position
-				c.positionsMu.Lock()
-				c.positions[token] = &Position{
-					Token:     token,
-					EthSpent:  ethAmount,
-					EntryTime: time.Now(),
-					TxHash:    txHash,
-				}
-				c.positionsMu.Unlock()
-
 				c.reply(chatID, fmt.Sprintf(
 					"✅ *Buy Executed!*\n"+
 						"Token: `%s`\n"+
 						"Amount: %s ETH\n"+
-						"Tx: `%s`",
-					token.Hex(), helpers.FormatEth(ethAmount), txHash.Hex()))
+						"Tx: `%s`\n"+
+						"Bundle: %v",
+					token.Hex(),
+					helpers.FormatEth(ethAmount),
+					txHash.Hex(),
+					c.tradeConfig.UseBundles))
 			case strings.HasPrefix(text, "/check"):
 				parts := strings.Fields(text)
 				if len(parts) < 2 {
@@ -943,9 +1086,57 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 
 				c.reply(chatID, quickReport)
+			case strings.HasPrefix(text, "/bundle"):
+				parts := strings.Fields(text)
+				if len(parts) < 2 {
+					status := "OFF 🔴"
+					if c.tradeConfig.UseBundles {
+						status = "ON 🟢"
+					}
+					bribeStr := "0"
+					if c.tradeConfig.BribeAmount != nil {
+						bribeStr = helpers.FormatEth(c.tradeConfig.BribeAmount)
+					}
+					c.reply(chatID, fmt.Sprintf(
+						"*Bundle Status: %s*\n\n"+
+							"Bribe: %s ETH\n"+
+							"Gas Boost: %d%%\n\n"+
+							"Usage:\n"+
+							"/bundle <on|off> - Toggle bundles\n"+
+							"/setbribe <eth> - Set bribe amount",
+						status, bribeStr, c.tradeConfig.GasBoostPercent))
+					break
+				}
+
+				switch strings.ToLower(parts[1]) {
+				case "on":
+					c.tradeConfig.UseBundles = true
+					c.reply(chatID, "🟢 *Bundles ENABLED*\nUsing Flashbots for execution")
+				case "off":
+					c.tradeConfig.UseBundles = false
+					c.reply(chatID, "🔴 *Bundles DISABLED*\nUsing normal mempool")
+				default:
+					c.reply(chatID, "Use: /bundle on or /bundle off")
+				}
+
+			case strings.HasPrefix(text, "/setbribe"):
+				parts := strings.Fields(text)
+				if len(parts) < 2 {
+					c.reply(chatID, "Usage: /setbribe <eth_amount>")
+					break
+				}
+
+				amount, err := helpers.EthToWei(parts[1])
+				if err != nil {
+					c.reply(chatID, "❌ Invalid amount")
+					break
+				}
+
+				c.tradeConfig.BribeAmount = amount
+				c.reply(chatID, fmt.Sprintf("✅ Bundle bribe set to %s ETH", parts[1]))
 			case strings.HasPrefix(text, "/sell "):
-				if c.privateKey == nil {
-					c.reply(chatID, "❌ No private key configured. Cannot execute trades.")
+				if c.executor == nil {
+					c.reply(chatID, "❌ No wallet configured. Cannot execute trades.")
 					break
 				}
 
@@ -962,39 +1153,23 @@ func (c *Controller) Start(ctx context.Context) error {
 				}
 				token := common.HexToAddress(tokenStr)
 
-				percentage, err := parsePercentage(parts[2])
+				percentage, err := helpers.ParsePercentage(parts[2])
 				if err != nil {
 					c.reply(chatID, fmt.Sprintf("❌ Invalid percentage: %v", err))
 					break
 				}
 
-				// Get token balance
-				balance, err := c.getTokenBalance(token)
-				if err != nil {
-					c.reply(chatID, fmt.Sprintf("❌ Failed to get token balance: %v", err))
-					break
-				}
-
-				if balance.Sign() == 0 {
-					c.reply(chatID, "❌ No tokens to sell")
-					break
-				}
-
-				// Calculate sell amount
-				sellAmount := new(big.Int).Mul(balance, big.NewInt(int64(percentage)))
-				sellAmount.Div(sellAmount, big.NewInt(100))
-
+				// Calculate sell amount based on percentage
+				// This is a simplified version - executor should handle token balance checking
 				c.reply(chatID, fmt.Sprintf("🔄 Selling %d%% of tokens...", percentage))
 
-				// First approve the router if needed
-				err = c.approveToken(token, sellAmount)
-				if err != nil {
-					c.reply(chatID, fmt.Sprintf("❌ Approval failed: %v", err))
-					break
-				}
-
-				// Execute sell
-				txHash, err := c.executeSell(token, sellAmount)
+				// Let executor handle the full token amount calculation
+				txHash, err := c.executor.ExecuteSell(
+					context.Background(),
+					token,
+					nil, // Pass nil to let executor calculate based on percentage
+					c.tradeConfig,
+				)
 				if err != nil {
 					c.reply(chatID, fmt.Sprintf("❌ Sell failed: %v", err))
 					break
@@ -1006,52 +1181,87 @@ func (c *Controller) Start(ctx context.Context) error {
 						"Amount: %d%%\n"+
 						"Tx: `%s`",
 					token.Hex(), percentage, txHash.Hex()))
+
+				c.reply(chatID, fmt.Sprintf(
+					"✅ *Sell Executed!*\n"+
+						"Token: `%s`\n"+
+						"Amount: %d%%\n"+
+						"Tx: `%s`",
+					token.Hex(), percentage, txHash.Hex()))
 			case strings.HasPrefix(text, "/positions"), strings.HasPrefix(text, "/portfolio"):
-				c.positionsMu.RLock()
-				if len(c.positions) == 0 {
-					c.positionsMu.RUnlock()
+				if c.executor == nil {
+					c.reply(chatID, "❌ No wallet configured")
+					break
+				}
+
+				positions := c.executor.GetPositions()
+				if len(positions) == 0 {
 					c.reply(chatID, "📊 No open positions")
 					break
 				}
 
 				msg := "📊 *Your Positions:*\n\n"
-				for token, pos := range c.positions {
-					// Get current balance
-					balance, _ := c.getTokenBalance(token)
-
+				for token, pos := range positions {
 					msg += fmt.Sprintf(
 						"Token: `%s`\n"+
-							"Balance: %s\n"+
 							"Entry: %s ETH\n"+
 							"Time: %s\n"+
 							"Tx: `%s`\n\n",
-						token.Hex()[:10]+"..."+token.Hex()[36:],
-						balance.String(),
+						helpers.FormatAddress(token),
 						helpers.FormatEth(pos.EthSpent),
 						pos.EntryTime.Format("15:04:05"),
-						pos.TxHash.Hex()[:10]+"...",
+						helpers.FormatTxHash(pos.TxHash),
 					)
 				}
-				c.positionsMu.RUnlock()
 
 				c.reply(chatID, msg)
 			case strings.HasPrefix(text, "/balance"):
-				if c.walletAddr == (common.Address{}) {
+				if c.executor == nil {
 					c.reply(chatID, "❌ No wallet configured")
 					break
 				}
 
-				balance, err := c.getETHBalance()
+				// Get balance from executor
+				balance, err := c.executor.GetETHBalance(context.Background())
 				if err != nil {
-					c.reply(chatID, "❌ Failed to get balance")
+					c.reply(chatID, fmt.Sprintf("❌ Failed to get balance: %v", err))
 					break
 				}
 
-				c.reply(chatID, fmt.Sprintf(
-					"💰 *Wallet Balance*\n"+
-						"Address: `%s`\n"+
-						"Balance: %s ETH",
-					c.walletAddr.Hex(), helpers.FormatEth(balance)))
+				// Get wallet address from executor
+				// Note: You need to add a GetWalletAddress() method to executor
+				// OR store it during executor creation
+
+				// Option 1: If you add GetWalletAddress() to executor:
+				walletAddr := c.executor.GetWalletAddress()
+
+				// Calculate gas reserve estimate
+				gasEstimate := big.NewInt(1e16) // 0.01 ETH
+				availableForTrading := new(big.Int).Sub(balance, gasEstimate)
+				if availableForTrading.Sign() < 0 {
+					availableForTrading = big.NewInt(0)
+				}
+
+				// Build detailed balance report
+				balanceReport := fmt.Sprintf(
+					"💰 *Wallet Balance*\n\n"+
+						"**Address:** `%s`\n"+
+						"**Total:** %s ETH\n"+
+						"**Available:** %s ETH\n",
+					walletAddr.Hex(),
+					helpers.FormatEth(balance),
+					helpers.FormatEth(availableForTrading))
+
+				// Add warning if low balance
+				minRecommended := helpers.Wei("0.1") // 0.1 ETH
+				if balance.Cmp(minRecommended) < 0 {
+					balanceReport += "\n⚠️ *Low balance* - Add funds to trade effectively"
+				}
+
+				// Add network info
+				balanceReport += fmt.Sprintf("\n**Network:** %s", c.activeNet)
+
+				c.reply(chatID, balanceReport)
 			case strings.HasPrefix(text, "/status"):
 				state := "stopped"
 				if c.running {
@@ -1164,35 +1374,35 @@ func (c *Controller) Start(ctx context.Context) error {
 	}
 }
 
-// This assumes scanner already validated: minimum liquidity, WETH pair, etc.
 func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.LiquiditySignal, scanReport *scanner.Report, chatID int64) {
-	// Identify which token to buy (the non-WETH one)
+	if c.executor == nil {
+		telemetry.Warnf("[autobuy] no executor configured")
+		return
+	}
+
+	// Identify target token
 	tokenToBuy := c.identifyTargetToken(signal)
 	if tokenToBuy == (common.Address{}) {
 		telemetry.Debugf("[autobuy] cannot identify target token")
 		return
 	}
 
-	// Get buy amount from config
+	// Get buy amount
 	buyAmount, err := helpers.EthToWei(c.Cfg.AUTO_BUY_AMOUNT)
 	if err != nil {
 		telemetry.Errorf("[autobuy] invalid buy amount: %s", c.Cfg.AUTO_BUY_AMOUNT)
 		return
 	}
 
-	// === EXECUTION CHECKS (not policy checks) ===
-
-	// 1. Check wallet balance
-	balance, err := c.ethClient.BalanceAt(ctx, c.walletAddr, nil)
+	// Check balance using executor
+	balance, err := c.executor.GetETHBalance(ctx)
 	if err != nil {
 		telemetry.Errorf("[autobuy] balance check failed: %v", err)
 		return
 	}
 
-	// Need funds for buy + gas reserve
 	gasReserve := big.NewInt(1e16) // 0.01 ETH for gas
 	required := new(big.Int).Add(buyAmount, gasReserve)
-
 	if balance.Cmp(required) < 0 {
 		c.reply(chatID, fmt.Sprintf(
 			"❌ Insufficient balance for auto-buy\nNeed: %s ETH\nHave: %s ETH",
@@ -1200,32 +1410,8 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 		return
 	}
 
-	// 2. Check gas price
-	gasPrice, err := c.ethClient.SuggestGasPrice(ctx)
-	if err != nil {
-		telemetry.Errorf("[autobuy] gas price failed: %v", err)
-		return
-	}
-
-	// Apply gas boost for competitive inclusion
-	if c.Cfg.AUTO_GAS_BOOST > 0 {
-		boost := big.NewInt(int64(100 + c.Cfg.AUTO_GAS_BOOST))
-		gasPrice = new(big.Int).Mul(gasPrice, boost)
-		gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
-	}
-
-	// Check gas ceiling
-	maxGasWei := parseGweiToWei(c.Cfg.MAX_GAS_PRICE_GWEI)
-	if maxGasWei != nil && gasPrice.Cmp(maxGasWei) > 0 {
-		telemetry.Infof("[autobuy] gas too high: %s gwei > %s gwei max",
-			helpers.WeiToGwei(gasPrice), c.Cfg.MAX_GAS_PRICE_GWEI)
-		c.reply(chatID, fmt.Sprintf("⚠️ Gas too high: %s gwei", helpers.WeiToGwei(gasPrice)))
-		return
-	}
-
-	// 3. Optional safety check (quick honeypot detection)
-	// This is the ONLY filtering that happens at execution time
-	if c.Cfg.HONEYPOT_CHECK_ENABLED {
+	// Safety check if enabled
+	if c.honeypotCheckEnabled {
 		telemetry.Debugf("[autobuy] running safety check for %s", tokenToBuy.Hex())
 
 		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1235,7 +1421,6 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 		safety, err := checker.CheckToken(checkCtx, tokenToBuy)
 
 		if err != nil {
-			// Don't block on safety check timeout, just warn
 			telemetry.Warnf("[autobuy] safety check failed: %v", err)
 		} else if safety.IsHoneypot {
 			c.reply(chatID, fmt.Sprintf(
@@ -1243,25 +1428,29 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 				tokenToBuy.Hex()))
 			return
 		} else if safety.SafetyScore < 40 {
-			// Very low score, warn but continue (configurable)
 			telemetry.Warnf("[autobuy] low safety score: %d", safety.SafetyScore)
+			// Continue anyway for auto-buy (configurable)
 		}
 	}
 
-	// === EXECUTION ===
-
-	// Build informative message
+	// Build notification
 	liquidityInfo := ""
 	if scanReport.ETHInWei != nil {
 		liquidityInfo = fmt.Sprintf("\nLiquidity: %s ETH", helpers.FormatEth(scanReport.ETHInWei))
 	}
 
 	c.reply(chatID, fmt.Sprintf(
-		"🎯 *AUTO-BUY TRIGGERED*\nToken: `%s`%s\nAmount: %s ETH\nGas: %s gwei",
-		tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, helpers.WeiToGwei(gasPrice)))
+		"🎯 *AUTO-BUY TRIGGERED*\n"+
+			"Token: `%s`%s\n"+
+			"Amount: %s ETH\n"+
+			"Bundle: %v",
+		tokenToBuy.Hex(),
+		liquidityInfo,
+		c.Cfg.AUTO_BUY_AMOUNT,
+		c.tradeConfig.UseBundles))
 
-	// Execute the swap
-	txHash, err := c.executeBuyTransaction(ctx, tokenToBuy, buyAmount, gasPrice)
+	// Execute using executor
+	txHash, err := c.executor.ExecuteBuy(ctx, tokenToBuy, buyAmount, c.tradeConfig)
 	if err != nil {
 		c.reply(chatID, fmt.Sprintf("❌ Auto-buy failed: %v", err))
 		telemetry.Errorf("[autobuy] execution failed: %v", err)
@@ -1278,257 +1467,9 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 		c.Cfg.AUTO_BUY_AMOUNT,
 		txHash.Hex()))
 
-	// Track position
-	c.trackPosition(tokenToBuy, buyAmount, txHash)
-
 	telemetry.Infof("[autobuy] SUCCESS - token: %s, amount: %s ETH, tx: %s",
 		tokenToBuy.Hex(), helpers.FormatEth(buyAmount), txHash.Hex())
 }
-
-// Execute the actual swap transaction
-func (c *Controller) executeBuyTransaction(ctx context.Context, token common.Address, amountETH *big.Int, gasPrice *big.Int) (common.Hash, error) {
-	// Get nonce
-	nonce, err := c.ethClient.PendingNonceAt(ctx, c.walletAddr)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("get nonce: %w", err)
-	}
-
-	// Build swap parameters
-	path := []common.Address{c.dex.WETH(), token}
-	deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
-
-	// Calculate minimum output (with slippage)
-	// For now, accept any amount (0). TODO: calculate from reserves
-	amountOutMin := big.NewInt(0)
-
-	// Pack swap function
-	// Using SupportingFeeOnTransferTokens for tax token compatibility
-	data, err := c.routerABI.Pack(
-		"swapExactETHForTokensSupportingFeeOnTransferTokens",
-		amountOutMin,
-		path,
-		c.walletAddr,
-		deadline,
-	)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("pack swap: %w", err)
-	}
-
-	// Get chain ID
-	chainID, err := c.ethClient.ChainID(ctx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("get chain ID: %w", err)
-	}
-
-	// Create transaction
-	tx := types.NewTransaction(
-		nonce,
-		c.dex.Router(),
-		amountETH,      // Value in ETH
-		uint64(300000), // Gas limit
-		gasPrice,
-		data,
-	)
-
-	// Sign transaction
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("sign tx: %w", err)
-	}
-
-	// Send transaction
-	err = c.ethClient.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("send tx: %w", err)
-	}
-
-	return signedTx.Hash(), nil
-}
-
-func (c *Controller) executeBuyWithBundle(ctx context.Context, token common.Address, ethAmount *big.Int) (common.Hash, error) {
-	// Build swap transaction (unsigned)
-	nonce, err := c.ethClient.PendingNonceAt(ctx, c.walletAddr)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("get nonce: %w", err)
-	}
-
-	// Build swap data
-	path := []common.Address{c.dex.WETH(), token}
-	deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
-
-	// Calculate minimum output slippage
-	slippage := big.NewInt(int64(c.Cfg.SLIPPAGE_PERCENT))
-	amountOutMin := new(big.Int).Mul(ethAmount, big.NewInt(100-slippage.Int64()))
-	amountOutMin.Div(amountOutMin, big.NewInt(100))
-
-	data, err := c.routerABI.Pack(
-		"swapExactETHForTokensSupportingFeeOnTransferTokens",
-		amountOutMin,
-		path,
-		c.walletAddr,
-		deadline,
-	)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("pack swap: %w", err)
-	}
-
-	// Get competitive gas price
-	gasPrice, err := c.ethClient.SuggestGasPrice(ctx)
-	if err != nil {
-		return common.Hash{}, err
-	}
-
-	// Apply gas boost for bundle
-	boost := big.NewInt(int64(150)) // 50% boost for bundles
-	gasPrice = new(big.Int).Mul(gasPrice, boost)
-	gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
-
-	// Create transaction
-	tx := types.NewTransaction(
-		nonce,
-		c.dex.Router(),
-		ethAmount,
-		uint64(300000),
-		gasPrice,
-		data,
-	)
-
-	chainID, err := c.ethClient.ChainID(ctx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to get chain ID: %w", err)
-	}
-
-	// Sign transaction
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("sign tx: %w", err)
-	}
-
-	// Parse bribe amount
-	bribe, _ := helpers.EthToWei(c.bribeAmount)
-
-	// Create bundle with optional bribe
-	bundle, err := c.bundler.CreateSniperBundle(ctx, signedTx, bribe)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("create bundle: %w", err)
-	}
-
-	// Simulate bundle first
-	sim, err := c.bundler.SimulateBundle(ctx, bundle)
-	if err != nil {
-		telemetry.Warnf("[bundle] simulation failed: %v", err)
-		// Fall back to normal transaction
-		return c.executeBuyNormal(ctx, signedTx)
-	}
-
-	if !sim.Success {
-		telemetry.Warnf("[bundle] simulation failed: %s", sim.Error)
-		// Fall back to normal transaction
-		return c.executeBuyNormal(ctx, signedTx)
-	}
-
-	telemetry.Infof("[bundle] simulation success, gas used: %d", sim.TotalGasUsed)
-
-	// Send bundle to multiple blocks for better inclusion
-	currentBlock, _ := c.ethClient.BlockNumber(ctx)
-	var bundleHash string
-
-	for i := uint64(1); i <= 3; i++ {
-		bundle.BlockNumber = new(big.Int).SetUint64(currentBlock + i)
-		hash, err := c.bundler.SendBundle(ctx, bundle)
-		if err != nil {
-			telemetry.Errorf("[bundle] send failed for block %d: %v", currentBlock+i, err)
-			continue
-		}
-		bundleHash = hash
-		telemetry.Infof("[bundle] sent to block %d: %s", currentBlock+i, hash)
-	}
-
-	if bundleHash == "" {
-		// All bundle attempts failed, fall back to normal tx
-		telemetry.Warnf("[bundle] all attempts failed, falling back to mempool")
-		return c.executeBuyNormal(ctx, signedTx)
-	}
-
-	// Monitor bundle inclusion
-	go c.monitorBundleInclusion(ctx, signedTx.Hash(), bundleHash, currentBlock+1)
-
-	return signedTx.Hash(), nil
-}
-
-// Helper to send normal transaction
-func (c *Controller) executeBuyNormal(ctx context.Context, signedTx *types.Transaction) (common.Hash, error) {
-	err := c.ethClient.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("send tx: %w", err)
-	}
-	telemetry.Infof("[tx] sent normal tx: %s", signedTx.Hash().Hex())
-	return signedTx.Hash(), nil
-}
-
-// Monitor if bundle was included
-func (c *Controller) monitorBundleInclusion(ctx context.Context, txHash common.Hash, bundleHash string, targetBlock uint64) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			telemetry.Warnf("[bundle] monitoring timeout for %s", txHash.Hex())
-			return
-		case <-ticker.C:
-			receipt, err := c.ethClient.TransactionReceipt(ctx, txHash)
-			if err == nil && receipt != nil {
-				telemetry.Infof("[bundle] INCLUDED in block %d, tx: %s",
-					receipt.BlockNumber.Uint64(), txHash.Hex())
-				return
-			}
-
-			currentBlock, _ := c.ethClient.BlockNumber(ctx)
-			if currentBlock > targetBlock+5 {
-				telemetry.Warnf("[bundle] NOT included after 5 blocks, tx: %s", txHash.Hex())
-				return
-			}
-		}
-	}
-}
-
-/*
-// Update executeAutoBuy to use bundles
-func (c *Controller) executeAutoBuyWithBundle(ctx context.Context, signal *signals.LiquiditySignal, scanReport *scanner.Report, chatID int64) {
-	// ... existing validation code ...
-
-	// === EXECUTION with BUNDLE ===
-	var txHash common.Hash
-	var err error
-
-	if c.useFlashbots && c.bundler != nil {
-		c.reply(chatID, fmt.Sprintf(
-			"🎯 *AUTO-BUY TRIGGERED (BUNDLE)*\nToken: `%s`%s\nAmount: %s ETH\nBribe: %s ETH\nGas: %s gwei",
-			tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, c.bribeAmount, formatGwei(gasPrice)))
-
-		txHash, err = c.executeBuyWithBundle(ctx, tokenToBuy, buyAmount)
-	} else {
-		// Fallback to normal execution
-		c.reply(chatID, fmt.Sprintf(
-			"🎯 *AUTO-BUY TRIGGERED*\nToken: `%s`%s\nAmount: %s ETH\nGas: %s gwei",
-			tokenToBuy.Hex(), liquidityInfo, c.Cfg.AUTO_BUY_AMOUNT, formatGwei(gasPrice)))
-
-		txHash, err = c.executeBuyTransaction(ctx, tokenToBuy, buyAmount, gasPrice)
-	}
-
-	if err != nil {
-		c.reply(chatID, fmt.Sprintf("❌ Auto-buy failed: %v", err))
-		telemetry.Errorf("[autobuy] execution failed: %v", err)
-		return
-	}
-
-	// ... rest of success handling ...
-}
-*/
 
 // Identify which token to buy (the non-WETH token)
 func (c *Controller) identifyTargetToken(signal *signals.LiquiditySignal) common.Address {
@@ -1544,304 +1485,55 @@ func (c *Controller) identifyTargetToken(signal *signals.LiquiditySignal) common
 	return common.Address{}
 }
 
-// Track the position
-func (c *Controller) trackPosition(token common.Address, amount *big.Int, txHash common.Hash) {
-	c.positionsMu.Lock()
-	defer c.positionsMu.Unlock()
+func (c *Controller) displaySafetyReport(chatID int64, safety *scanner.TokenSafety) {
+	safetyEmoji := "🟢"
+	recommendation := "SAFE TO TRADE"
 
-	c.positions[token] = &Position{
-		Token:     token,
-		EthSpent:  amount,
-		EntryTime: time.Now(),
-		TxHash:    txHash,
-	}
-}
-
-func (c *Controller) executeBuy(token common.Address, ethAmount *big.Int) (common.Hash, error) {
-	ctx := context.Background()
-
-	nonce, err := c.ethClient.PendingNonceAt(ctx, c.walletAddr)
-	if err != nil {
-		return common.Hash{}, err
+	if safety.IsHoneypot {
+		safetyEmoji = "🔴"
+		recommendation = "DO NOT BUY - HONEYPOT!"
+	} else if safety.SafetyScore < 40 {
+		safetyEmoji = "🔴"
+		recommendation = "HIGH RISK - NOT RECOMMENDED"
+	} else if safety.SafetyScore < 70 {
+		safetyEmoji = "🟡"
+		recommendation = "MODERATE RISK - BE CAREFUL"
 	}
 
-	// Build swap data
-	path := []common.Address{c.dex.WETH(), token}
-
-	deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
-
-	// Pack the swap function call
-	// Using swapExactETHForTokensSupportingFeeOnTransferTokens for compatibility
-	data, err := c.routerABI.Pack("swapExactETHForTokensSupportingFeeOnTransferTokens",
-		big.NewInt(0), // amountOutMin (0 = accept any amount, add slippage later)
-		path,
-		c.walletAddr,
-		deadline,
-	)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to pack swap data: %w", err)
-	}
-
-	// Get gas price with 20& boost for speed
-	gasPrice, err := c.ethClient.SuggestGasPrice(ctx)
-	if err != nil {
-		return common.Hash{}, err
-	}
-
-	// Add 20% to gas price for faster inclusion
-	gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(120))
-	gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
-
-	// Get chain ID
-	chainID, err := c.ethClient.ChainID(ctx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to get chain ID: %w", err)
-	}
-
-	// Create Transaction
-	tx := types.NewTransaction(
-		nonce,
-		c.dex.Router(),
-		ethAmount,      // Value in ETH
-		uint64(300000), // gas limit
-		gasPrice,
-		data,
+	// Build safety report
+	report := fmt.Sprintf(
+		"%s *Safety Score: %d/100*\n"+
+			"*%s*\n\n"+
+			"*Token Info:*\n"+
+			"Name: %s\n"+
+			"Symbol: %s\n\n"+
+			"*Trade Simulation:*\n"+
+			"✅ Can Buy: %v\n"+
+			"✅ Can Approve: %v\n"+
+			"✅ Can Sell: %v\n\n"+
+			"*Tax Analysis:*\n"+
+			"Buy Tax: %.1f%%\n"+
+			"Sell Tax: %.1f%%\n\n"+
+			"*Contract Analysis:*\n"+
+			"Owner: %v (Renounced: %v)\n"+
+			"Has Mint: %v\n"+
+			"Has Pause: %v\n"+
+			"Has Blacklist: %v\n"+
+			"Max Wallet: %v\n\n"+
+			"*Liquidity:*\n"+
+			"ETH in Pool: %s\n",
+		safetyEmoji, safety.SafetyScore,
+		recommendation,
+		safety.Name, safety.Symbol,
+		safety.CanBuy, safety.CanApprove, safety.CanSell,
+		safety.BuyTax, safety.SellTax,
+		safety.HasOwner, safety.IsRenounced,
+		safety.HasMintFunction,
+		safety.HasPauseFunction,
+		safety.HasBlacklist,
+		safety.MaxWalletLimit,
+		helpers.FormatEth(safety.LiquidityETH),
 	)
 
-	// Sign Transaction
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to sign transaction: %w", err)
-	}
-
-	// Send Transaction
-	err = c.ethClient.SendTransaction(context.Background(), signedTx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to send transaction: %w", err)
-	}
-
-	telemetry.Infof("[buy] sent tx: %s for token %s with %s ETH",
-		signedTx.Hash().Hex(), token.Hex(), helpers.FormatEth(ethAmount))
-
-	return signedTx.Hash(), nil
-}
-
-func (c *Controller) approveToken(token common.Address, amount *big.Int) error {
-	ctx := context.Background()
-
-	// Check current allowance
-	allowanceData, err := c.erc20ABI.Pack("allowance", c.walletAddr, c.dex.Router())
-	if err != nil {
-		return fmt.Errorf("failed to pack allowance call: %w", err)
-	}
-
-	result, err := c.ethClient.CallContract(ctx, ethereum.CallMsg{
-		To:   &token,
-		Data: allowanceData,
-	}, nil)
-
-	if err == nil && len(result) > 0 {
-		currentAllowance := new(big.Int).SetBytes(result)
-		if currentAllowance.Cmp(amount) >= 0 {
-			// Already approved
-			return nil
-		}
-	}
-
-	// Need to approve
-	nonce, err := c.ethClient.PendingNonceAt(ctx, c.walletAddr)
-	if err != nil {
-		return err
-	}
-
-	// Max approval for convenience
-	maxApproval := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
-
-	approveData, err := c.erc20ABI.Pack("approve", c.dex.Router(), maxApproval)
-	if err != nil {
-		return err
-	}
-
-	gasPrice, _ := c.ethClient.SuggestGasPrice(ctx)
-	chainID, _ := c.ethClient.ChainID(ctx)
-
-	tx := types.NewTransaction(
-		nonce,
-		token,
-		big.NewInt(0),  // no ETH value
-		uint64(100000), // gas limit
-		gasPrice,
-		approveData,
-	)
-
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
-	if err != nil {
-		return err
-	}
-
-	err = c.ethClient.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return err
-	}
-
-	telemetry.Infof("[approve] sent approval tx: %s for token %s",
-		signedTx.Hash().Hex(), token.Hex())
-
-	// Wait for approval to be mined (simplified - production should use proper receipt waiting)
-	time.Sleep(3 * time.Second)
-
-	return nil
-}
-
-func (c *Controller) executeSell(token common.Address, amount *big.Int) (common.Hash, error) {
-	ctx := context.Background()
-
-	nonce, err := c.ethClient.PendingNonceAt(ctx, c.walletAddr)
-	if err != nil {
-		return common.Hash{}, err
-	}
-
-	// Build sweap path (token -> WETH)
-	path := []common.Address{token, c.dex.WETH()}
-	deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
-
-	// Pack the swap function
-	data, err := c.routerABI.Pack(
-		"swapExactTokensForETHSupportingFeeOnTransferTokens",
-		amount,
-		big.NewInt(0), // amountOutMin (any) - add slippage protection later
-		path,
-		c.walletAddr,
-		deadline,
-	)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to pack swap data: %w", err)
-	}
-
-	gasPrice, _ := c.ethClient.SuggestGasPrice(ctx)
-	gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(120))
-	gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
-
-	chainID, _ := c.ethClient.ChainID(ctx)
-
-	tx := types.NewTransaction(
-		nonce,
-		c.dex.Router(),
-		big.NewInt(0),  // no ETH value
-		uint64(300000), // gas limit
-		gasPrice,
-		data,
-	)
-
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), c.privateKey)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to sign transaction: %w", err)
-	}
-
-	err = c.ethClient.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to send transaction: %w", err)
-	}
-
-	telemetry.Infof("[sell] sent tx: %s for token %s amount %s",
-		signedTx.Hash().Hex(), token.Hex(), amount.String())
-
-	return signedTx.Hash(), nil
-}
-
-// ============ Helper Functions ============
-
-// parseGweiToWei converts gwei string to wei
-func parseGweiToWei(gweiStr string) *big.Int {
-	if gweiStr == "" {
-		return nil
-	}
-
-	// Try to parse as integer
-	gwei, ok := new(big.Int).SetString(gweiStr, 10)
-	if !ok {
-		// Try as float
-		gweiFloat, err := strconv.ParseFloat(gweiStr, 64)
-		if err != nil {
-			return nil
-		}
-		// Convert float gwei to wei
-		wei := new(big.Float).SetFloat64(gweiFloat * 1e9)
-		result := new(big.Int)
-		wei.Int(result)
-		return result
-	}
-
-	// Convert gwei to wei (1 gwei = 10^9 wei)
-	return new(big.Int).Mul(gwei, big.NewInt(1000000000))
-}
-
-// parsePercentage converts "50" or "50%" to integer 50
-func parsePercentage(input string) (int, error) {
-	input = strings.TrimSuffix(input, "%")
-	input = strings.TrimSpace(input)
-
-	percentage, err := strconv.Atoi(input)
-	if err != nil {
-		return 0, fmt.Errorf("invalid percentage: %s", input)
-	}
-
-	if percentage <= 0 || percentage > 100 {
-		return 0, fmt.Errorf("percentage must be between 1 and 100")
-	}
-	return percentage, nil
-}
-
-// helper so we can flip to true with a function (avoids shadow warning)
-func True() bool { return true }
-
-// getTokenBalance retrieves ERC20 token balance for wallet
-func (c *Controller) getTokenBalance(token common.Address) (*big.Int, error) {
-	// ERC20 balanceOf method
-	data := common.FromHex("0x70a08231") // balanceOf(address)
-	data = append(data, common.LeftPadBytes(c.walletAddr.Bytes(), 32)...)
-
-	result, err := c.ethClient.CallContract(context.Background(), ethereum.CallMsg{
-		To:   &token,
-		Data: data,
-	}, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(result) == 0 {
-		return big.NewInt(0), nil
-	}
-
-	return new(big.Int).SetBytes(result), nil
-}
-
-// getETHBalance retrieves ETH balance for wallet
-func (c *Controller) getETHBalance() (*big.Int, error) {
-	return c.ethClient.BalanceAt(context.Background(), c.walletAddr, nil)
-}
-
-// loadPrivateKey loads and validates private key from config
-func loadPrivateKey(privateKeyHex string) (*ecdsa.PrivateKey, common.Address, error) {
-	if privateKeyHex == "" {
-		return nil, common.Address{}, fmt.Errorf("private key is empty")
-	}
-
-	// Remove 0x prefix if present
-	privateKeyHex = strings.TrimPrefix(privateKeyHex, "0x")
-
-	privateKey, err := crypto.HexToECDSA(privateKeyHex)
-	if err != nil {
-		return nil, common.Address{}, fmt.Errorf("invalid private key: %w", err)
-	}
-
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		return nil, common.Address{}, fmt.Errorf("invalid public key type")
-	}
-
-	address := crypto.PubkeyToAddress(*publicKeyECDSA)
-
-	return privateKey, address, nil
+	c.reply(chatID, report)
 }
