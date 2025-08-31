@@ -21,43 +21,11 @@ import (
 	execution "github.com/meltingclock/biteblock_v1/internal/executor"
 	"github.com/meltingclock/biteblock_v1/internal/helpers"
 	"github.com/meltingclock/biteblock_v1/internal/mempool"
+	"github.com/meltingclock/biteblock_v1/internal/network"
 	"github.com/meltingclock/biteblock_v1/internal/scanner"
 	"github.com/meltingclock/biteblock_v1/internal/signals"
 	"github.com/meltingclock/biteblock_v1/internal/telemetry"
 )
-
-type NetPreset struct {
-	WSSURL  string
-	Factory common.Address
-	Router  common.Address
-	WETH    common.Address
-	ChainID int64
-}
-
-// Fill the Base V2 factory/router with whatever DEX you target (Sushi V2/Pancake V2 on Base/etc.)
-var netPresets = map[string]NetPreset{
-	"ethereum": {
-		WSSURL:  "ws://127.0.0.1:8545",
-		Factory: common.HexToAddress("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"), // Uniswap V2
-		Router:  common.HexToAddress("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"), // Uniswap V2
-		WETH:    common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-		ChainID: 1,
-	},
-	"bsc": {
-		WSSURL:  "wss://bsc-ws-node.nariox.org:443",
-		Factory: common.HexToAddress("0xBCfCcbde45cE874adCB698cC183deBcF17952812"), // Pancake V2
-		Router:  common.HexToAddress("0x10ED43C718714eb63d5aA57B78B54704E256024E"), // Pancake V2
-		WETH:    common.HexToAddress("0xBB4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), // WBNB
-		ChainID: 56,
-	},
-	"base": {
-		WSSURL:  "wss://base-mainnet.g.alchemy.com/v2/<KEY>",
-		Factory: common.HexToAddress("0x<BASE_V2_FACTORY>"),
-		Router:  common.HexToAddress("0x<BASE_V2_ROUTER>"),
-		WETH:    common.HexToAddress("0x4200000000000000000000000000000000000006"),
-		ChainID: 8453,
-	},
-}
 
 type Controller struct {
 	Bot  *tgbotapi.BotAPI
@@ -173,7 +141,7 @@ func (c *Controller) reply(chatID int64, text string) {
 
 func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) error {
 	// 1. GET NETWORK PRESET
-	p, ok := netPresets[strings.ToLower(c.activeNet)]
+	p, ok := network.Network[strings.ToLower(c.activeNet)]
 	if !ok {
 		return fmt.Errorf("unknown network preset: %s", c.activeNet)
 	}
@@ -203,17 +171,18 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 		return fmt.Errorf("failed to get chain ID: %w", err)
 	}
 
-	if chainID.Int64() != p.ChainID {
+	if chainID.Int64() != p.ChainID && chainID.Int64() != 31337 {
 		telemetry.Warnf("[controller] chain ID mismatch: got %d, expected %d",
 			chainID.Int64(), p.ChainID)
 	}
 
 	// 4. BUILD DEX REGISTRY
 	c.dex = v2.NewRegistry(v2.Config{
-		Network: v2.Network(strings.ToLower(c.activeNet)),
-		Factory: p.Factory,
-		Router:  p.Router,
-		WETH:    p.WETH,
+		Network:      v2.Network(strings.ToLower(c.activeNet)),
+		Factory:      p.Factory,
+		Router:       p.Router,
+		WETH:         p.WETH,
+		InitCodeHash: p.InitCodeHash,
 	})
 
 	telemetry.Infof("[controller] DEX configured - Factory: %s, Router: %s, WETH: %s",
@@ -648,7 +617,7 @@ func (c *Controller) Start(ctx context.Context) error {
 						"/set_chat <id> – restrict bot to a specific chat ID\n")
 			case strings.HasPrefix(text, "/net "):
 				arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/net")))
-				if _, ok := netPresets[arg]; !ok {
+				if _, ok := network.Network[arg]; !ok {
 					c.reply(chatID, "❌ Unknown network. Use: ethereum, bsc, base")
 					break
 				}
@@ -1353,7 +1322,7 @@ func (c *Controller) Start(ctx context.Context) error {
 				if c.running {
 					state = "running"
 				}
-				p, ok := netPresets[strings.ToLower(c.activeNet)]
+				p, ok := network.Network[strings.ToLower(c.activeNet)]
 				if !ok {
 					c.reply(chatID, fmt.Sprintf("State: *%s*\nActive net: *%s* (unknown preset)", state, c.activeNet))
 					break

@@ -30,6 +30,10 @@ type TradeExecutor struct {
 	erc20ABI   abi.ABI
 	bundler    *bundle.Bundler
 
+	// Bundle metricts (NEW)
+	bundleAttempts int
+	bundleSuccess  int
+
 	// Position tracking
 	positions   map[common.Address]*Position
 	positionsMu sync.RWMutex
@@ -143,6 +147,14 @@ func (te *TradeExecutor) ExecuteBuy(
 	var txHash common.Hash
 	if config.UseBundles && te.bundler != nil {
 		txHash, err = te.executeWithBundle(ctx, tx, config.BribeAmount)
+		if err != nil {
+			// Fallback to normal mempool on bundle failure
+			telemetry.Warnf("[executor] bundle failed, falling back to mempool: %v", err)
+			txHash, err = te.sendTransaction(ctx, tx)
+			if err != nil {
+				return common.Hash{}, fmt.Errorf("fallback send failed: %w", err)
+			}
+		}
 	} else {
 		txHash, err = te.sendTransaction(ctx, tx)
 	}
@@ -371,6 +383,8 @@ func (te *TradeExecutor) executeWithBundle(ctx context.Context, tx *types.Transa
 		return te.sendTransaction(ctx, tx)
 	}
 
+	te.bundleAttempts++
+
 	// Create bundle
 	bundle, err := te.bundler.CreateSniperBundle(ctx, tx, bribeAmount)
 	if err != nil {
@@ -378,22 +392,32 @@ func (te *TradeExecutor) executeWithBundle(ctx context.Context, tx *types.Transa
 		return te.sendTransaction(ctx, tx)
 	}
 
-	// Simulate bundle
+	// Simulate bundle first (IMPORTANT!)
 	sim, err := te.bundler.SimulateBundle(ctx, bundle)
 	if err != nil || !sim.Success {
 		telemetry.Warnf("[executor] bundle simulation failed")
 		return te.sendTransaction(ctx, tx)
 	}
 
-	// Send bundle to multiple blocks
-	currentBlock, _ := te.client.BlockNumber(ctx)
-	for i := uint64(1); i <= 3; i++ {
-		bundle.BlockNumber = new(big.Int).SetUint64(currentBlock + i)
-		_, err := te.bundler.SendBundle(ctx, bundle)
-		if err != nil {
-			telemetry.Errorf("[executor] bundle send failed: %v", err)
+	if !sim.Success {
+		telemetry.Errorf("[executor] bundle simulation shows failure: %s", sim.Error)
+		// Check if it's a revert
+		if len(sim.Results) > 0 && sim.Results[0].Revert != "" {
+			return common.Hash{}, fmt.Errorf("transaction would revert: %s", sim.Results[0].Revert)
 		}
+		return te.sendTransaction(ctx, tx) // Fallback
 	}
+
+	// Send bundle to multiple blocks for better inclusion
+	err = te.bundler.SendToMultipleBlocks(ctx, bundle, 3) // Target next 3 blocks
+	if err != nil {
+		telemetry.Warnf("[executor] bundle send failed: %v", err)
+		return te.sendTransaction(ctx, tx)
+	}
+
+	te.bundleSuccess++
+	telemetry.Infof("[executor] bundle sent successfully (success rate: %d/%d)",
+		te.bundleSuccess, te.bundleAttempts)
 
 	return tx.Hash(), nil
 }

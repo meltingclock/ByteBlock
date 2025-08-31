@@ -1,6 +1,7 @@
 package signals
 
 import (
+	"bytes"
 	"context"
 	"math/big"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	dexv2 "github.com/meltingclock/biteblock_v1/internal/dex/v2"
 )
@@ -34,11 +36,12 @@ type LiquiditySignal struct {
 }
 
 type LiquidityAnalyzer struct {
-	dex     *dexv2.Registry
-	router  abi.ABI
-	factory abi.ABI
-	ec      *ethclient.Client
-	pairs   *PairRegistry
+	dex          *dexv2.Registry
+	router       abi.ABI
+	factory      abi.ABI
+	ec           *ethclient.Client
+	pairs        *PairRegistry
+	initCodeHash common.Hash
 }
 
 func (k LiquidityKind) String() string {
@@ -55,7 +58,7 @@ func (k LiquidityKind) String() string {
 func NewLiquidityAnalyzer(ec *ethclient.Client, dex *dexv2.Registry, pr *PairRegistry) *LiquidityAnalyzer {
 	rab, _ := abi.JSON(strings.NewReader(dexv2.RouterABI))
 	fab, _ := abi.JSON(strings.NewReader(dexv2.FactoryABI))
-	return &LiquidityAnalyzer{dex: dex, router: rab, factory: fab, ec: ec, pairs: pr}
+	return &LiquidityAnalyzer{dex: dex, router: rab, factory: fab, ec: ec, pairs: pr, initCodeHash: dex.InitCodeHash()}
 
 }
 
@@ -129,17 +132,40 @@ func (la *LiquidityAnalyzer) AnalyzePending(ctx context.Context, tx *types.Trans
 	return s, nil
 }
 
+// Update calculatePairAddress to be a method
+func (la *LiquidityAnalyzer) calculatePairAddress(token0, token1 common.Address) common.Address {
+	// Ensure token0 < token1 (canonical ordering)
+	if bytes.Compare(token0.Bytes(), token1.Bytes()) > 0 {
+		token0, token1 = token1, token0
+	}
+
+	// Calculate CREATE2 address
+	salt := crypto.Keccak256(append(token0.Bytes(), token1.Bytes()...))
+
+	data := []byte{0xff}
+	data = append(data, la.dex.Factory().Bytes()...)
+	data = append(data, salt...)
+	data = append(data, la.initCodeHash.Bytes()...)
+
+	hash := crypto.Keccak256(data)
+	return common.BytesToAddress(hash[12:])
+}
+
 func (la *LiquidityAnalyzer) getPair(ctx context.Context, a, b common.Address) (pair, token0, token1 common.Address, _ error) {
 	// First try local cache from PairRegistry
 	// (We don't know the pair addr if PairCreated not mined yet; but for most forks, getPair returns address(0) until mined)
 	// Fall back to on-chain getPair.
 	// Optional: try cache first (adjust method name to your PairRegistry)
+	if strings.ToLower(a.Hex()) < strings.ToLower(b.Hex()) {
+		token0, token1 = a, b
+	} else {
+		token0, token1 = b, a
+	}
+
+	// First try local cache from PairRegistry
 	if la.pairs != nil {
-		if p, ok := la.pairs.GetByTokens(a, b); ok { // <-- rename to your actual method
-			if strings.ToLower(a.Hex()) < strings.ToLower(b.Hex()) {
-				return p, a, b, nil
-			}
-			return p, b, a, nil
+		if p, ok := la.pairs.GetByTokens(a, b); ok {
+			return p, token0, token1, nil
 		}
 	}
 
@@ -150,16 +176,18 @@ func (la *LiquidityAnalyzer) getPair(ctx context.Context, a, b common.Address) (
 	callMsg := ethereum.CallMsg{To: ptr(la.dex.Factory()), Data: input}
 	out, err := la.ec.CallContract(ctx, callMsg, nil)
 	if err != nil {
-		return common.Address{}, common.Address{}, common.Address{}, err
+		// If call fails, calculate deterministic address
+		calculated := la.calculatePairAddress(token0, token1)
+		return calculated, token0, token1, nil
 	}
 	var addr common.Address
 	if err := la.factory.UnpackIntoInterface(&addr, "getPair", out); err != nil {
 		return common.Address{}, common.Address{}, common.Address{}, err
 	}
 
-	// order tokens
-	if strings.ToLower(a.Hex()) < strings.ToLower(b.Hex()) {
-		return addr, a, b, nil
+	// If pair doesn't exist yet (returns 0x0), calculate it
+	if addr == (common.Address{}) {
+		addr = la.calculatePairAddress(token0, token1)
 	}
 	return addr, b, a, nil
 }

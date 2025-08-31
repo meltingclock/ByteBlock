@@ -23,10 +23,11 @@ const (
 )
 
 type Config struct {
-	Network Network
-	Factory common.Address
-	Router  common.Address
-	WETH    common.Address
+	Network      Network
+	Factory      common.Address
+	Router       common.Address
+	WETH         common.Address
+	InitCodeHash string // Hex string without 0x prefix
 }
 
 type Registry struct {
@@ -355,9 +356,18 @@ func idTo4(id any) [4]byte {
 	return out
 }
 
+func (r *Registry) InitCodeHash() common.Hash {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return common.HexToHash(r.cfg.InitCodeHash)
+}
+
 func (cfg Config) Validate() error {
 	if (cfg.Factory == (common.Address{})) || (cfg.Router == (common.Address{})) || (cfg.WETH == (common.Address{})) {
 		return fmt.Errorf("v2.Config: factory/router/WETH must be set")
+	}
+	if cfg.InitCodeHash == "" {
+		return fmt.Errorf("v2.Config: InitCodeHash must be set")
 	}
 	return nil
 }

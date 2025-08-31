@@ -130,8 +130,6 @@ func Tail(n int) []string {
 	rbMu.Lock()
 	defer rbMu.Unlock()
 
-	out := make([]string, 0, n)
-
 	// Determine actual number of entries available
 	available := rbSize
 	if !rbWrapped {
@@ -145,14 +143,22 @@ func Tail(n int) []string {
 		n = available
 	}
 
-	// Start from the most recent entry and go backwards
-	start := rbNext - 1
+	out := make([]string, 0, n)
+
+	// Calculate starting position
+	start := rbNext - n
 	if start < 0 {
-		start = rbSize - 1
+		if rbWrapped {
+			start += rbSize
+		} else {
+			start = 0
+			n = rbNext // Only return what we have
+		}
 	}
 
+	// Collect entries
 	for i := 0; i < n; i++ {
-		idx := (start - i + rbNext) % rbSize
+		idx := (start + i) % rbSize
 		entry := rbData[idx]
 		if !entry.timestamp.IsZero() {
 			formatted := fmt.Sprintf("%s [%s] %s",
@@ -162,9 +168,6 @@ func Tail(n int) []string {
 			out = append(out, formatted)
 		}
 	}
-	// reverse to chronological
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
+
 	return out
 }

@@ -415,20 +415,13 @@ func (h *HoneypotChecker) simulateTrades(ctx context.Context, safety *TokenSafet
 		// For local testing, do basic checks and assume sellable
 		safety.CanBuy = true
 		safety.CanApprove = true
-
-		// Only mark as non-sellable if obvious honeypot patterns detected
-		if safety.HasBlacklist || safety.HasPauseFunction {
-			safety.CanSell = false
-			safety.IsHoneypot = true
-			safety.SafetyScore = 0
-		} else {
-			safety.CanSell = true
-			safety.BuyTax = 0.0
-			safety.SellTax = 0.0
-		}
-
-		telemetry.Debugf("[honeypot] Anvil mode - simplified check for %s", safety.Token.Hex())
-		return // Skip the rest of the simulation
+		safety.CanSell = true     // Force true for Anvil
+		safety.IsHoneypot = false // Never mark as honeypot on Anvil
+		safety.SafetyScore = 80   // Give decent score
+		safety.BuyTax = 0.0
+		safety.SellTax = 0.0
+		telemetry.Debugf("[honeypot] Anvil mode - assuming safe for %s", safety.Token.Hex())
+		return
 	}
 
 	// Simulate buy

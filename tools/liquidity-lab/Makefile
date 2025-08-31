@@ -9,7 +9,7 @@ anvil:
 	  if [ -f "$(ENVFILE)" ]; then . "$(ENVFILE)"; fi; \
 	  if [ -n "$$MAINNET_RPC" ]; then \
 	    echo "[anvil] forking: $$MAINNET_RPC"; \
-	    exec anvil --fork-url "$$MAINNET_RPC" --block-time 2 --chain-id 1; \
+	    exec anvil --fork-url "$$MAINNET_RPC" --block-time 2 --chain-id 31337; \
 	  else \
 	    echo "[anvil] WARNING: MAINNET_RPC not set -> starting PLAIN anvil (no Uniswap at 0x7a25...)"; \
 	    exec anvil --block-time 2 --chain-id 1; \
@@ -22,7 +22,7 @@ anvil-fork:
 	@sh -c ' \
 	  if [ -f "$(ENVFILE)" ]; then . "$(ENVFILE)"; fi; \
 	  : $${MAINNET_RPC:?Set MAINNET_RPC in .env or env}; \
-	  exec anvil --fork-url "$$MAINNET_RPC" --block-time 2 --chain-id 1 \
+	  exec anvil --fork-url "$$MAINNET_RPC" --block-time 2 --chain-id 31337 \
 	'
 
 anvil-local:

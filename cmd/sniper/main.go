@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -23,33 +22,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	/*
-		cfg, err := config.Load(config.DefaultPath)
-		if err != nil {
-			log.Fatalf("config load: %v", err)
-		}
-
-		// Optional: fail-fast if token missing (you can relax this if you want)
-		if err := cfg.Validate(); err != nil {
-			log.Fatalf("config validation: %v", err)
-		}
-
-		// Ctrl-C / SIGTERM handling
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
-
-		// Telegram controller owns network presets + mempool + signals
-		ctrl, err := telegram.NewController(cfg, config.DefaultPath)
-		if err != nil {
-			log.Fatalf("telegram init: %v", err)
-		}
-
-		telemetry.Infof("telegram mode: listening for commands")
-		if err := ctrl.Start(ctx); err != nil {
-			log.Fatalf("controller error: %v", err)
-		}
-	*/
 	runWithTokenWait(ctx)
+
+	telemetry.Infof("Main exiting gracefully..")
 }
 
 func runWithTokenWait(ctx context.Context) {
@@ -64,16 +39,16 @@ func runWithTokenWait(ctx context.Context) {
 			// Try to load config
 			cfg, err := config.Load(configPath)
 			if err != nil {
-				log.Printf("Config load error: %v", err)
+				telemetry.Errorf("Config load error: %v", err) // Changed to telemetry
 				time.Sleep(5 * time.Second)
 				continue
 			}
 
 			// Check if token exists
 			if cfg.TELEGRAM_TOKEN == "" {
-				log.Println("⏳ Waiting for Telegram token...")
-				log.Println("📝 Please add TELEGRAM_TOKEN to config.yml")
-				log.Printf("📁 Config location: %s\n", configPath)
+				telemetry.Infof("⏳ Waiting for Telegram token...") // Changed to telemetry
+				telemetry.Infof("📝 Please add TELEGRAM_TOKEN to config.yml")
+				telemetry.Infof("📁 Config location: %s", configPath)
 
 				// Watch for config changes
 				if waitForToken(ctx, configPath) {
@@ -87,19 +62,21 @@ func runWithTokenWait(ctx context.Context) {
 
 			ctrl, err := telegram.NewController(cfg, configPath)
 			if err != nil {
-				log.Printf("❌ Controller init failed: %v", err)
-				log.Println("⏳ Retrying in 10 seconds...")
+				telemetry.Errorf("❌ Controller init failed: %v", err) // Changed to telemetry
+				telemetry.Infof("⏳ Retrying in 10 seconds...")
 				time.Sleep(10 * time.Second)
 				continue
 			}
 
-			// Run the bot
+			// Run the bot - THIS IS THE KEY CHANGE
+			// ctrl.Start() should block until the bot stops
+			telemetry.Infof("Starting controller...")
 			if err := ctrl.Start(ctx); err != nil {
-				log.Printf("Controller error: %v", err)
+				telemetry.Errorf("Controller error: %v", err)
 
 				// Check if it's a token error
 				if isTokenError(err) {
-					log.Println("❌ Token appears invalid, please check and update config.yml")
+					telemetry.Errorf("❌ Token appears invalid, please check and update config.yml")
 					cfg.TELEGRAM_TOKEN = "" // Clear invalid token
 					_ = config.Save(configPath, cfg)
 					continue
@@ -110,7 +87,19 @@ func runWithTokenWait(ctx context.Context) {
 				continue
 			}
 
-			return // Normal exit
+			// DON'T RETURN HERE! The bot stopped, but we might want to restart
+			telemetry.Infof("Controller stopped, checking if we should restart...")
+
+			// Check if context is done (user pressed Ctrl+C)
+			select {
+			case <-ctx.Done():
+				return // Exit cleanly
+			default:
+				// Controller stopped for other reason, maybe restart?
+				telemetry.Warnf("Controller stopped unexpectedly, restarting in 5 seconds...")
+				time.Sleep(5 * time.Second)
+				continue // Loop back to try again
+			}
 		}
 	}
 }
