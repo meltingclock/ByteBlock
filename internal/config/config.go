@@ -22,7 +22,8 @@ type Config struct {
 	HONEYPOT_CHECK_MODE    string   `yaml:"HONEYPOT_CHECK_MODE"` // "always", "smart", "never"
 	TRUSTED_TOKENS         []string `yaml:"TRUSTED_TOKENS"`      // Skip check for these
 	TRUSTED_DEPLOYERS      []string `yaml:"TRUSTED_DEPLOYERS"`   // Skip check for tokens from these addresses
-	MIN_LIQUIDITY_ETH      string   `yaml:"MIN_LIQUIDITY_ETH"`   // Minimum liquidity to skip check
+	// CONSOLIDATED: Single minimum liquidity setting (replaces multiple settings)
+	MIN_LIQUIDITY_ETH string `yaml:"MIN_LIQUIDITY_ETH"` // Minimum liquidity required (configurable via telegram)
 
 	// Auto-buy defaults
 	AUTO_BUY_ENABLED   bool   `yaml:"AUTO_BUY_ENABLED"`

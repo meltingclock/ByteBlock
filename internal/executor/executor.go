@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -70,11 +69,6 @@ func NewTradeExecutor(
 		return nil, fmt.Errorf("parse router ABI: %w", err)
 	}
 
-	erc20ABI, err := abi.JSON(strings.NewReader(ERC20_ABI))
-	if err != nil {
-		return nil, fmt.Errorf("parse ERC20 ABI: %w", err)
-	}
-
 	chainID, err := client.ChainID(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("get chain ID: %w", err)
@@ -95,7 +89,7 @@ func NewTradeExecutor(
 		walletAddr: walletAddr,
 		dex:        dex,
 		routerABI:  routerABI,
-		erc20ABI:   erc20ABI,
+		erc20ABI:   helpers.GetERC20ABI(),
 		bundler:    bundler,
 		positions:  make(map[common.Address]*Position),
 	}, nil
@@ -456,47 +450,11 @@ func (te *TradeExecutor) ensureApproval(ctx context.Context, token common.Addres
 // Helper functions
 
 func (te *TradeExecutor) getTokenBalance(ctx context.Context, token common.Address) (*big.Int, error) {
-	data, err := te.erc20ABI.Pack("balanceOf", te.walletAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	result, err := te.client.CallContract(ctx, ethereum.CallMsg{
-		To:   &token,
-		Data: data,
-	}, nil)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if len(result) == 0 {
-		return big.NewInt(0), nil
-	}
-
-	return new(big.Int).SetBytes(result), nil
+	return helpers.GetTokenBalance(ctx, te.client, token, te.walletAddr)
 }
 
 func (te *TradeExecutor) getAllowance(ctx context.Context, token common.Address) (*big.Int, error) {
-	data, err := te.erc20ABI.Pack("allowance", te.walletAddr, te.dex.Router())
-	if err != nil {
-		return nil, err
-	}
-
-	result, err := te.client.CallContract(ctx, ethereum.CallMsg{
-		To:   &token,
-		Data: data,
-	}, nil)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if len(result) == 0 {
-		return big.NewInt(0), nil
-	}
-
-	return new(big.Int).SetBytes(result), nil
+	return helpers.GetTokenAllowance(ctx, te.client, token, te.walletAddr, te.dex.Router())
 }
 
 func (te *TradeExecutor) trackPosition(token common.Address, ethSpent *big.Int, txHash common.Hash) {
@@ -541,37 +499,6 @@ func (te *TradeExecutor) GetPositions() map[common.Address]*Position {
 func (te *TradeExecutor) GetETHBalance(ctx context.Context) (*big.Int, error) {
 	return te.client.BalanceAt(ctx, te.walletAddr, nil)
 }
-
-// Minimal ERC20 ABI
-const ERC20_ABI = `[
-	{
-		"constant": true,
-		"inputs": [{"name": "_owner", "type": "address"}],
-		"name": "balanceOf",
-		"outputs": [{"name": "", "type": "uint256"}],
-		"type": "function"
-	},
-	{
-		"constant": false,
-		"inputs": [
-			{"name": "_spender", "type": "address"},
-			{"name": "_value", "type": "uint256"}
-		],
-		"name": "approve",
-		"outputs": [{"name": "", "type": "bool"}],
-		"type": "function"
-	},
-	{
-		"constant": true,
-		"inputs": [
-			{"name": "_owner", "type": "address"},
-			{"name": "_spender", "type": "address"}
-		],
-		"name": "allowance",
-		"outputs": [{"name": "", "type": "uint256"}],
-		"type": "function"
-	}
-]`
 
 func (te *TradeExecutor) GetWalletAddress() common.Address {
 	return te.walletAddr

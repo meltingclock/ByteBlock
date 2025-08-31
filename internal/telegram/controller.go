@@ -167,7 +167,7 @@ func NewController(cfg *config.Config, path string) (*Controller, error) {
 
 func (c *Controller) reply(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
+	//msg.ParseMode = "Markdown"
 	_, _ = c.Bot.Send(msg)
 }
 
@@ -298,7 +298,7 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 	liq := signals.NewLiquidityAnalyzer(c.ethClient, c.dex, pairReg)
 	telemetry.Infof("[controller] liquidity analyzer ready")
 
-	// Scanner (safety & filter checks)
+	// Scanner (safety & filter checks) - CONSOLIDATED: Single minimum liquidity setting
 	minLiquidityWei := helpers.Wei(c.Cfg.MIN_LIQUIDITY_ETH)
 	if minLiquidityWei == nil {
 		minLiquidityWei = helpers.Wei("0.5") // Default 0.5 ETH
@@ -307,12 +307,12 @@ func (c *Controller) startOnActivePreset(ctx context.Context, chatID int64) erro
 	scan := scanner.New(c.ethClient, c.dex, scanner.Config{
 		RequireWethPair:   true,
 		MinEthLiquidity:   minLiquidityWei,
-		MinTokenLiquidity: nil,
+		MinTokenLiquidity: minLiquidityWei, // Use same value for both
 		AllowCreators:     map[common.Address]bool{},
 		DenyCreators:      map[common.Address]bool{},
 		Deadline:          250 * time.Millisecond,
 	})
-	telemetry.Infof("[controller] scanner configured - min liquidity: %s ETH",
+	telemetry.Infof("[controller] scanner configured - min liquidity: %s ETH (CONSOLIDATED)",
 		helpers.FormatEth(minLiquidityWei))
 
 	// 7. CONFIGURE AUTO-BUY
@@ -628,6 +628,7 @@ func (c *Controller) Start(ctx context.Context) error {
 						"/autobuy <on|off> - Enable/disable auto-buy\n"+
 						"/setamount <eth> - Set buy amount (e.g., 0.5)\n"+
 						"/setgas <gwei> - Set max gas price\n"+
+						"/setliquidity <eth> - Set minimum liquidity threshold\n"+
 						"/safety - Toggle safety checks\n\n"+
 						"▶️ *Control*\n"+
 						"/start – Start mempool watcher\n"+
@@ -839,16 +840,84 @@ func (c *Controller) Start(ctx context.Context) error {
 				c.Cfg.MAX_GAS_PRICE_GWEI = parts[1]
 				_ = config.Save(c.Path, c.Cfg)
 				c.reply(chatID, fmt.Sprintf("✅ Max gas set to %s gwei", parts[1]))
+			case strings.HasPrefix(text, "/setamount"):
+				parts := strings.Fields(text)
+				if len(parts) < 2 {
+					c.reply(chatID, fmt.Sprintf(
+						"Current buy amount: %s ETH\n"+
+							"Usage: /setamount <eth_amount>\n"+
+							"Example: /setamount 0.1",
+						c.Cfg.AUTO_BUY_AMOUNT))
+					break
+				}
 
-			case strings.HasPrefix(text, "/safety"):
-				// Toggle safety check
-				c.Cfg.HONEYPOT_CHECK_ENABLED = !c.Cfg.HONEYPOT_CHECK_ENABLED
+				// Validate the amount
+				_, err := helpers.EthToWei(parts[1])
+				if err != nil {
+					c.reply(chatID, fmt.Sprintf("❌ Invalid amount: %v", err))
+					break
+				}
+
+				c.Cfg.AUTO_BUY_AMOUNT = parts[1]
+				_ = config.Save(c.Path, c.Cfg)
+				c.reply(chatID, fmt.Sprintf("✅ Buy amount set to %s ETH", parts[1]))
+
+			case strings.HasPrefix(text, "/setliquidity"):
+				parts := strings.Fields(text)
+				if len(parts) < 2 {
+					c.reply(chatID, fmt.Sprintf(
+						"Current min liquidity: %s ETH\n"+
+							"Usage: /setliquidity <eth_amount>\n"+
+							"Example: /setliquidity 1.0",
+						c.Cfg.MIN_LIQUIDITY_ETH))
+					break
+				}
+
+				// Validate the amount
+				_, err := helpers.EthToWei(parts[1])
+				if err != nil {
+					c.reply(chatID, fmt.Sprintf("❌ Invalid amount: %v", err))
+					break
+				}
+
+				c.Cfg.MIN_LIQUIDITY_ETH = parts[1]
 				_ = config.Save(c.Path, c.Cfg)
 
-				if c.Cfg.HONEYPOT_CHECK_ENABLED {
-					c.reply(chatID, "🛡️ Safety check ENABLED")
+				// Update the scanner config if running
+				if c.running {
+					c.reply(chatID, fmt.Sprintf(
+						"✅ Min liquidity set to %s ETH\n"+
+							"⚠️ Restart with `/stop` and `/start` to apply",
+						parts[1]))
 				} else {
+					c.reply(chatID, fmt.Sprintf(
+						"✅ Min liquidity set to %s ETH",
+						parts[1]))
+				}
+			case strings.HasPrefix(text, "/safety"):
+				parts := strings.Fields(text)
+				if len(parts) < 2 {
+					status := "DISABLED ❌"
+					if c.honeypotCheckEnabled {
+						status = "ENABLED ✅"
+					}
+					c.reply(chatID, fmt.Sprintf("Safety check: %s\nUsage: /safety <on|off>", status))
+					break
+				}
+
+				switch strings.ToLower(parts[1]) {
+				case "on", "enable", "true":
+					c.Cfg.HONEYPOT_CHECK_ENABLED = true
+					c.honeypotCheckEnabled = true
+					_ = config.Save(c.Path, c.Cfg)
+					c.reply(chatID, "🛡️ Safety check ENABLED")
+				case "off", "disable", "false":
+					c.Cfg.HONEYPOT_CHECK_ENABLED = false
+					c.honeypotCheckEnabled = false
+					_ = config.Save(c.Path, c.Cfg)
 					c.reply(chatID, "⚠️ Safety check DISABLED - Be careful!")
+				default:
+					c.reply(chatID, "Usage: /safety <on|off>")
 				}
 			case strings.HasPrefix(text, "/start"):
 				if c.running {
@@ -1163,11 +1232,34 @@ func (c *Controller) Start(ctx context.Context) error {
 				// This is a simplified version - executor should handle token balance checking
 				c.reply(chatID, fmt.Sprintf("🔄 Selling %d%% of tokens...", percentage))
 
-				// Let executor handle the full token amount calculation
+				// Get current token balance
+				balance, err := helpers.GetTokenBalance(context.Background(), c.ethClient, token, c.executor.GetWalletAddress())
+				if err != nil {
+					c.reply(chatID, fmt.Sprintf("❌ Failed to get token balance: %v", err))
+					break
+				}
+
+				if balance.Sign() == 0 {
+					c.reply(chatID, "❌ No tokens to sell")
+					break
+				}
+
+				// Calculate sell amount: (balance * percentage) / 100
+				sellAmount := new(big.Int).Mul(balance, big.NewInt(int64(percentage)))
+				sellAmount.Div(sellAmount, big.NewInt(100))
+
+				if sellAmount.Sign() == 0 {
+					c.reply(chatID, "❌ Sell amount too small")
+					break
+				}
+
+				c.reply(chatID, fmt.Sprintf("📊 Selling %s tokens (%d%% of %s)",
+					sellAmount.String(), percentage, balance.String()))
+
 				txHash, err := c.executor.ExecuteSell(
 					context.Background(),
 					token,
-					nil, // Pass nil to let executor calculate based on percentage
+					sellAmount, // Pass calculated amount instead of nil
 					c.tradeConfig,
 				)
 				if err != nil {
@@ -1182,12 +1274,6 @@ func (c *Controller) Start(ctx context.Context) error {
 						"Tx: `%s`",
 					token.Hex(), percentage, txHash.Hex()))
 
-				c.reply(chatID, fmt.Sprintf(
-					"✅ *Sell Executed!*\n"+
-						"Token: `%s`\n"+
-						"Amount: %d%%\n"+
-						"Tx: `%s`",
-					token.Hex(), percentage, txHash.Hex()))
 			case strings.HasPrefix(text, "/positions"), strings.HasPrefix(text, "/portfolio"):
 				if c.executor == nil {
 					c.reply(chatID, "❌ No wallet configured")
@@ -1414,7 +1500,7 @@ func (c *Controller) executeAutoBuy(ctx context.Context, signal *signals.Liquidi
 	if c.honeypotCheckEnabled {
 		telemetry.Debugf("[autobuy] running safety check for %s", tokenToBuy.Hex())
 
-		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // Same timeout as manual buy
 		defer cancel()
 
 		checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
@@ -1508,9 +1594,9 @@ func (c *Controller) displaySafetyReport(chatID int64, safety *scanner.TokenSafe
 			"Name: %s\n"+
 			"Symbol: %s\n\n"+
 			"*Trade Simulation:*\n"+
-			"✅ Can Buy: %v\n"+
-			"✅ Can Approve: %v\n"+
-			"✅ Can Sell: %v\n\n"+
+			"%s Can Buy: %v\n"+
+			"%s Can Approve: %v\n"+
+			"%s Can Sell: %v\n\n"+
 			"*Tax Analysis:*\n"+
 			"Buy Tax: %.1f%%\n"+
 			"Sell Tax: %.1f%%\n\n"+
@@ -1525,7 +1611,9 @@ func (c *Controller) displaySafetyReport(chatID int64, safety *scanner.TokenSafe
 		safetyEmoji, safety.SafetyScore,
 		recommendation,
 		safety.Name, safety.Symbol,
-		safety.CanBuy, safety.CanApprove, safety.CanSell,
+		boolIcon(safety.CanBuy), safety.CanBuy,
+		boolIcon(safety.CanApprove), safety.CanApprove,
+		boolIcon(safety.CanSell), safety.CanSell,
 		safety.BuyTax, safety.SellTax,
 		safety.HasOwner, safety.IsRenounced,
 		safety.HasMintFunction,
@@ -1536,4 +1624,11 @@ func (c *Controller) displaySafetyReport(chatID int64, safety *scanner.TokenSafe
 	)
 
 	c.reply(chatID, report)
+}
+
+func boolIcon(value bool) string {
+	if value {
+		return "✅"
+	}
+	return "❌"
 }
