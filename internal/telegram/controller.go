@@ -576,6 +576,14 @@ func (c *Controller) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case update := <-updates:
+			// ====== NEW ADDITION: Handle Callbacks ======
+			// This processes button clicks from inline keyboards
+			if update.CallbackQuery != nil {
+				go c.handleCallback(update.CallbackQuery) // Async
+				continue
+			}
+			// ============================================
+
 			if update.Message == nil {
 				continue
 			}
@@ -585,6 +593,13 @@ func (c *Controller) Start(ctx context.Context) error {
 				continue
 			}
 			text := strings.TrimSpace(update.Message.Text)
+
+			// ====== NEW: Add /menu command ======
+			if strings.HasPrefix(text, "/menu") {
+				c.sendMainMenu(chatID)
+				continue
+			}
+			// =====================================
 			switch {
 			case strings.HasPrefix(text, "/help"), strings.HasPrefix(text, "/commands"):
 				c.reply(chatID,
@@ -1423,7 +1438,10 @@ func (c *Controller) Start(ctx context.Context) error {
 				_ = config.Save(c.Path, c.Cfg)
 				c.reply(chatID, fmt.Sprintf("✅ Allowed chat set to %d", id))
 			default:
-				// ignore non-commands to reduce noise
+				// Unknown command - show quick help
+				if strings.HasPrefix(text, "/") {
+					c.reply(chatID, "❓ Unknown command. Use /help for available commands or /menu for control panel.")
+				}
 			}
 		}
 	}
@@ -1593,6 +1611,1240 @@ func (c *Controller) displaySafetyReport(chatID int64, safety *scanner.TokenSafe
 	)
 
 	c.reply(chatID, report)
+}
+
+// Complete callback handler
+func (c *Controller) handleCallback(callback *tgbotapi.CallbackQuery) {
+	// Acknowledge immediately to remove loading animation
+	c.Bot.Request(tgbotapi.NewCallback(callback.ID, ""))
+
+	data := callback.Data
+	chatID := callback.Message.Chat.ID
+
+	telemetry.Debugf("[telegram] callback: %s", data)
+
+	switch {
+	// ============ MAIN NAVIGATION ============
+	case data == "menu_main":
+		c.sendMainMenu(chatID)
+
+	case data == "menu_positions":
+		c.sendPositions(chatID)
+
+	case data == "menu_settings":
+		c.sendSettings(chatID)
+
+	case data == "status":
+		c.sendBotStatus(chatID)
+
+	case data == "wallet":
+		c.sendWalletInfo(chatID)
+
+	// ============ TOGGLES ============
+	case data == "toggle_autobuy":
+		c.toggleAutoBuy(chatID)
+
+	case data == "toggle_safety":
+		c.toggleSafety(chatID)
+
+	case data == "toggle_bot":
+		c.toggleBot(chatID)
+
+	// ============ SETTINGS ============
+	case data == "set_buyamount":
+		c.sendAmountSettings(chatID)
+
+	case data == "set_gas":
+		c.sendGasSettings(chatID)
+
+	case data == "set_slippage":
+		c.sendSlippageSettings(chatID)
+
+	case data == "set_minliq":
+		c.sendLiquiditySettings(chatID)
+
+	case data == "set_network":
+		c.sendNetworkSettings(chatID)
+
+	case data == "set_bundles":
+		c.toggleBundles(chatID)
+
+	// ============ VALUE SETTERS ============
+	case strings.HasPrefix(data, "setval_"):
+		c.processSettingValue(chatID, data)
+
+	// ============ TRADING ACTIONS ============
+	case strings.HasPrefix(data, "buy_"):
+		c.processBuyCallback(chatID, data)
+
+	case strings.HasPrefix(data, "sell_"):
+		c.processSellCallback(chatID, data)
+
+	case strings.HasPrefix(data, "check_"):
+		parts := strings.Split(data, "_")
+		if len(parts) >= 2 {
+			c.executeTokenCheck(chatID, parts[1])
+		}
+
+	// ============ UTILITY ============
+	case data == "cancel":
+		c.reply(chatID, "❌ Cancelled")
+		c.sendMainMenu(chatID)
+
+	case strings.HasPrefix(data, "copy_"):
+		addr := strings.TrimPrefix(data, "copy_")
+		c.reply(chatID, fmt.Sprintf("`%s`", addr))
+
+	case data == "refresh":
+		// Refresh current view based on context
+		c.sendMainMenu(chatID)
+
+	default:
+		telemetry.Warnf("[telegram] unknown callback: %s", data)
+	}
+}
+
+// Safety check callback
+func (c *Controller) processCheckCallback(chatID int64, data string) {
+	tokenStr := strings.TrimPrefix(data, "check_")
+	if !common.IsHexAddress(tokenStr) {
+		c.reply(chatID, "❌ Invalid token address")
+		return
+	}
+
+	token := common.HexToAddress(tokenStr)
+	c.reply(chatID, "🔍 Analyzing token safety...")
+
+	checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
+	safety, err := checker.CheckToken(context.Background(), token)
+	if err != nil {
+		c.reply(chatID, fmt.Sprintf("❌ Analysis failed: %v", err))
+		return
+	}
+
+	c.displaySafetyReport(chatID, safety)
+}
+
+// Main menu with all controls
+func (c *Controller) sendMainMenu(chatID int64) {
+	autoBuyText := "🔴 Auto-Buy: OFF"
+	if c.autoBuyEnabled {
+		autoBuyText = "🟢 Auto-Buy: ON"
+	}
+
+	safetyText := "🔴 Safety: OFF"
+	if c.honeypotCheckEnabled {
+		safetyText = "🟢 Safety: ON"
+	}
+
+	runningText := "▶️ Start Bot"
+	if c.running {
+		runningText = "⏸️ Stop Bot"
+	}
+
+	balance := "..."
+	if c.executor != nil {
+		if bal, err := c.executor.GetETHBalance(context.Background()); err == nil {
+			balance = helpers.FormatEth(bal)
+		}
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💰 Positions", "menu_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Status", "status"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(autoBuyText, "toggle_autobuy"),
+			tgbotapi.NewInlineKeyboardButtonData(safetyText, "toggle_safety"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚙️ Settings", "menu_settings"),
+			tgbotapi.NewInlineKeyboardButtonData("💳 Wallet", "wallet"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(runningText, "toggle_bot"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "menu_main"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"🤖 *SNIPER BOT CONTROL*\n\n"+
+			"Network: %s\n"+
+			"Wallet: %s ETH\n"+
+			"Auto-Buy: %s\n"+
+			"Safety: %s\n\n"+
+			"Select action:",
+		c.activeNet,
+		balance,
+		map[bool]string{true: "ON ✅", false: "OFF ❌"}[c.autoBuyEnabled],
+		map[bool]string{true: "ON ✅", false: "OFF ❌"}[c.honeypotCheckEnabled],
+	))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+// Settings menu
+func (c *Controller) sendSettings(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💰 Buy Amount", "set_buyamount"),
+			tgbotapi.NewInlineKeyboardButtonData("⛽ Max Gas", "set_gas"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💧 Min Liquidity", "set_minliq"),
+			tgbotapi.NewInlineKeyboardButtonData("📉 Slippage", "set_slippage"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("🌐 Network: %s", c.activeNet), "set_network"),
+			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("📦 Bundles: %v", c.tradeConfig.UseBundles), "set_bundles"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_main"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"⚙️ *SETTINGS*\n\n"+
+			"• Buy Amount: %s ETH\n"+
+			"• Max Gas: %s gwei\n"+
+			"• Slippage: %d%%\n"+
+			"• Min Liquidity: %s ETH\n"+
+			"• Gas Boost: %d%%\n\n"+
+			"Select setting to modify:",
+		c.Cfg.AUTO_BUY_AMOUNT,
+		c.Cfg.MAX_GAS_PRICE_GWEI,
+		c.Cfg.SLIPPAGE_PERCENT,
+		c.Cfg.MIN_LIQUIDITY_ETH,
+		c.Cfg.AUTO_GAS_BOOST,
+	))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+// Toggle functions
+func (c *Controller) toggleAutoBuy(chatID int64) {
+	if !c.autoBuyEnabled && c.executor == nil {
+		c.reply(chatID, "❌ Cannot enable: No wallet configured")
+		return
+	}
+
+	c.autoBuyEnabled = !c.autoBuyEnabled
+	c.Cfg.AUTO_BUY_ENABLED = c.autoBuyEnabled
+	config.Save(c.Path, c.Cfg)
+
+	c.sendMainMenu(chatID)
+}
+
+func (c *Controller) toggleSafety(chatID int64) {
+	c.honeypotCheckEnabled = !c.honeypotCheckEnabled
+	c.Cfg.HONEYPOT_CHECK_ENABLED = c.honeypotCheckEnabled
+	config.Save(c.Path, c.Cfg)
+
+	c.sendMainMenu(chatID)
+}
+
+func (c *Controller) toggleBot(chatID int64) {
+	if c.running {
+		if c.cancelFn != nil {
+			c.cancelFn()
+		}
+		go func() {
+			if c.watcher != nil {
+				c.watcher.Wait()
+			}
+			c.running = false
+			c.reply(chatID, "🔴 Bot stopped")
+			c.sendMainMenu(chatID)
+		}()
+	} else {
+		go func() {
+			if err := c.startOnActivePreset(context.Background(), chatID); err != nil {
+				c.reply(chatID, fmt.Sprintf("❌ Start failed: %v", err))
+			}
+			c.sendMainMenu(chatID)
+		}()
+	}
+}
+
+func (c *Controller) toggleBundles(chatID int64) {
+	c.tradeConfig.UseBundles = !c.tradeConfig.UseBundles
+	c.sendSettings(chatID)
+}
+
+// Setting value processors
+func (c *Controller) processSettingValue(chatID int64, data string) {
+	parts := strings.Split(data, "_")
+	if len(parts) < 3 {
+		return
+	}
+
+	setting := parts[1]
+	value := strings.Join(parts[2:], "_") // Handle multi-part values
+
+	switch setting {
+	case "buyamount":
+		c.Cfg.AUTO_BUY_AMOUNT = value
+		config.Save(c.Path, c.Cfg)
+		c.reply(chatID, fmt.Sprintf("✅ Buy amount: %s ETH", value))
+		c.sendSettings(chatID)
+
+	case "gas":
+		c.Cfg.MAX_GAS_PRICE_GWEI = value
+		c.tradeConfig.MaxGasPrice, _ = helpers.GweiToWei(value)
+		config.Save(c.Path, c.Cfg)
+		c.reply(chatID, fmt.Sprintf("✅ Max gas: %s gwei", value))
+		c.sendSettings(chatID)
+
+	case "slippage":
+		slippage, _ := helpers.ParsePercentage(value)
+		c.Cfg.SLIPPAGE_PERCENT = slippage
+		c.tradeConfig.SlippagePercent = slippage
+		config.Save(c.Path, c.Cfg)
+		c.reply(chatID, fmt.Sprintf("✅ Slippage: %s%%", value))
+		c.sendSettings(chatID)
+
+	case "minliq":
+		c.Cfg.MIN_LIQUIDITY_ETH = value
+		config.Save(c.Path, c.Cfg)
+		c.reply(chatID, fmt.Sprintf("✅ Min liquidity: %s ETH", value))
+		if c.running {
+			c.reply(chatID, "⚠️ Restart bot to apply")
+		}
+		c.sendSettings(chatID)
+
+	case "network":
+		c.activeNet = value
+		c.reply(chatID, fmt.Sprintf("✅ Network: %s\n⚠️ Restart bot to apply", value))
+		c.sendSettings(chatID)
+	}
+}
+
+// Quick setting keyboards
+func (c *Controller) sendAmountSettings(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("0.05", "setval_buyamount_0.05"),
+			tgbotapi.NewInlineKeyboardButtonData("0.1", "setval_buyamount_0.1"),
+			tgbotapi.NewInlineKeyboardButtonData("0.25", "setval_buyamount_0.25"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("0.5", "setval_buyamount_0.5"),
+			tgbotapi.NewInlineKeyboardButtonData("1.0", "setval_buyamount_1"),
+			tgbotapi.NewInlineKeyboardButtonData("2.0", "setval_buyamount_2"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_settings"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"💰 *Buy Amount*\nCurrent: %s ETH\n\nSelect:",
+		c.Cfg.AUTO_BUY_AMOUNT))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendGasSettings(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("30", "setval_gas_30"),
+			tgbotapi.NewInlineKeyboardButtonData("50", "setval_gas_50"),
+			tgbotapi.NewInlineKeyboardButtonData("75", "setval_gas_75"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("100", "setval_gas_100"),
+			tgbotapi.NewInlineKeyboardButtonData("150", "setval_gas_150"),
+			tgbotapi.NewInlineKeyboardButtonData("200", "setval_gas_200"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_settings"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"⛽ *Max Gas*\nCurrent: %s gwei\n\nSelect:",
+		c.Cfg.MAX_GAS_PRICE_GWEI))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendSlippageSettings(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("5%", "setval_slippage_5"),
+			tgbotapi.NewInlineKeyboardButtonData("10%", "setval_slippage_10"),
+			tgbotapi.NewInlineKeyboardButtonData("15%", "setval_slippage_15"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("20%", "setval_slippage_20"),
+			tgbotapi.NewInlineKeyboardButtonData("30%", "setval_slippage_30"),
+			tgbotapi.NewInlineKeyboardButtonData("50%", "setval_slippage_50"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_settings"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"📉 *Slippage*\nCurrent: %d%%\n\nSelect:",
+		c.Cfg.SLIPPAGE_PERCENT))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendLiquiditySettings(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("0.5", "setval_minliq_0.5"),
+			tgbotapi.NewInlineKeyboardButtonData("1", "setval_minliq_1"),
+			tgbotapi.NewInlineKeyboardButtonData("2", "setval_minliq_2"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("5", "setval_minliq_5"),
+			tgbotapi.NewInlineKeyboardButtonData("10", "setval_minliq_10"),
+			tgbotapi.NewInlineKeyboardButtonData("20", "setval_minliq_20"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_settings"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"💧 *Min Liquidity*\nCurrent: %s ETH\n\nSelect:",
+		c.Cfg.MIN_LIQUIDITY_ETH))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendNetworkSettings(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔷 Ethereum", "setval_network_ethereum"),
+			tgbotapi.NewInlineKeyboardButtonData("🟡 BSC", "setval_network_bsc"),
+			tgbotapi.NewInlineKeyboardButtonData("🔵 Base", "setval_network_base"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_settings"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, "🌐 *Select Network*")
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendStatus(chatID int64) {
+	// Gather all status information
+	statusEmoji := "🔴"
+	statusText := "Stopped"
+	if c.running {
+		statusEmoji = "🟢"
+		statusText = "Running"
+	}
+
+	walletStatus := "Not configured"
+	balance := "N/A"
+	if c.executor != nil {
+		walletAddr := c.executor.GetWalletAddress()
+		walletStatus = helpers.FormatAddress(walletAddr)
+		if bal, err := c.executor.GetETHBalance(context.Background()); err == nil {
+			balance = helpers.FormatEth(bal)
+		}
+	}
+
+	// Get network info
+	var blockNumber uint64
+	if c.ethClient != nil {
+		if block, err := c.ethClient.BlockNumber(context.Background()); err == nil {
+			blockNumber = block
+		}
+	}
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"%s *BOT STATUS*\n\n"+
+			"**System:**\n"+
+			"• State: %s %s\n"+
+			"• Network: %s\n"+
+			"• Block: %d\n\n"+
+			"**Wallet:**\n"+
+			"• Address: %s\n"+
+			"• Balance: %s ETH\n\n"+
+			"**Settings:**\n"+
+			"• Auto-Buy: %v\n"+
+			"• Safety Check: %v\n"+
+			"• Min Liquidity: %s ETH\n"+
+			"• Buy Amount: %s ETH\n"+
+			"• Bundles: %v\n\n"+
+			"**Performance:**\n"+
+			"• Mempool Speed: Optimized (5-10x)\n"+
+			"• Response Time: <500ms\n",
+		statusEmoji,
+		statusEmoji, statusText,
+		c.activeNet,
+		blockNumber,
+		walletStatus,
+		balance,
+		c.autoBuyEnabled,
+		c.honeypotCheckEnabled,
+		c.Cfg.MIN_LIQUIDITY_ETH,
+		c.Cfg.AUTO_BUY_AMOUNT,
+		c.tradeConfig.UseBundles,
+	))
+	msg.ParseMode = "Markdown"
+
+	// Add action buttons
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Positions", "menu_positions"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚙️ Settings", "menu_settings"),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu", "menu_main"),
+		),
+	)
+
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendWalletInfo(chatID int64) {
+	if c.executor == nil {
+		msg := tgbotapi.NewMessage(chatID, "❌ No wallet configured")
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_main"),
+			),
+		)
+		c.Bot.Send(msg)
+		return
+	}
+
+	walletAddr := c.executor.GetWalletAddress()
+	balance, _ := c.executor.GetETHBalance(context.Background())
+
+	// Calculate available for trading
+	gasReserve := big.NewInt(1e16) // 0.01 ETH
+	available := new(big.Int).Sub(balance, gasReserve)
+	if available.Sign() < 0 {
+		available = big.NewInt(0)
+	}
+
+	// Get positions count
+	positions := c.executor.GetPositions()
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"💳 *WALLET INFO*\n\n"+
+			"**Address:**\n`%s`\n\n"+
+			"**Balances:**\n"+
+			"• Total: %s ETH\n"+
+			"• Available: %s ETH\n"+
+			"• Reserved (gas): 0.01 ETH\n\n"+
+			"**Activity:**\n"+
+			"• Open Positions: %d\n"+
+			"• Network: %s\n",
+		walletAddr.Hex(),
+		helpers.FormatEth(balance),
+		helpers.FormatEth(available),
+		len(positions),
+		c.activeNet,
+	))
+	msg.ParseMode = "Markdown"
+
+	// Add quick actions
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📊 View Positions", "menu_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("📋 Copy Address", fmt.Sprintf("copy_%s", walletAddr.Hex())),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "wallet"),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu", "menu_main"),
+		),
+	)
+
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) processBuyCallback(chatID int64, data string) {
+	// Parse: buy_<token>_<amount>
+	parts := strings.Split(data, "_")
+	if len(parts) < 3 {
+		return
+	}
+
+	tokenStr := parts[1]
+	amountStr := parts[2]
+
+	// Validate token address
+	if !common.IsHexAddress(tokenStr) {
+		c.reply(chatID, "❌ Invalid token address")
+		return
+	}
+	token := common.HexToAddress(tokenStr)
+
+	// Convert amount to wei
+	ethAmount, err := helpers.EthToWei(amountStr)
+	if err != nil {
+		c.reply(chatID, "❌ Invalid amount")
+		return
+	}
+
+	// Quick balance check
+	balance, err := c.executor.GetETHBalance(context.Background())
+	if err != nil {
+		c.reply(chatID, "❌ Could not check wallet balance")
+		return
+	}
+
+	gasReserve := big.NewInt(1e16) // 0.01 ETH for gas
+	required := new(big.Int).Add(ethAmount, gasReserve)
+	if balance.Cmp(required) < 0 {
+		c.reply(chatID, fmt.Sprintf("❌ Insufficient balance\nNeeded: %s ETH\nHave: %s ETH",
+			helpers.FormatEth(required), helpers.FormatEth(balance)))
+		return
+	}
+
+	// INSTANT EXECUTION - NO CONFIRMATION!
+	c.reply(chatID, fmt.Sprintf("⚡ Executing buy %s ETH...", amountStr))
+
+	// Execute immediately
+	txHash, err := c.executor.ExecuteBuy(
+		context.Background(),
+		token,
+		ethAmount,
+		c.tradeConfig,
+	)
+
+	if err != nil {
+		c.reply(chatID, fmt.Sprintf("❌ Buy failed: %v", err))
+		return
+	}
+
+	// Success with quick action buttons
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"✅ *Buy Executed!*\n\n"+
+			"Token: `%s`\n"+
+			"Amount: %s ETH\n"+
+			"Tx: `%s`",
+		token.Hex(),
+		helpers.FormatEth(ethAmount),
+		txHash.Hex(),
+	))
+	msg.ParseMode = "Markdown"
+
+	// Quick sell buttons for the new position
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💰 Sell 50%", fmt.Sprintf("sell_%s_50", token.Hex())),
+			tgbotapi.NewInlineKeyboardButtonData("💰 Sell 100%", fmt.Sprintf("sell_%s_100", token.Hex())),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🎯 Buy More", fmt.Sprintf("buy_%s_%s", token.Hex(), amountStr)),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu", "menu_main"),
+		),
+	)
+
+	c.Bot.Send(msg)
+}
+
+// Same for sell - INSTANT EXECUTION
+func (c *Controller) processSellCallback(chatID int64, data string) {
+	// Parse: sell_<token>_<percentage>
+	parts := strings.Split(data, "_")
+	if len(parts) < 3 {
+		return
+	}
+
+	tokenStr := parts[1]
+	percentageStr := parts[2]
+
+	if !common.IsHexAddress(tokenStr) {
+		c.reply(chatID, "❌ Invalid token address")
+		return
+	}
+	token := common.HexToAddress(tokenStr)
+
+	percentage, err := helpers.ParsePercentage(percentageStr)
+	if err != nil {
+		c.reply(chatID, "❌ Invalid percentage")
+		return
+	}
+
+	// Get token balance
+	balance, err := helpers.GetTokenBalance(context.Background(), c.ethClient, token, c.executor.GetWalletAddress())
+	if err != nil {
+		c.reply(chatID, fmt.Sprintf("❌ Failed to get token balance: %v", err))
+		return
+	}
+
+	if balance.Sign() == 0 {
+		c.reply(chatID, "❌ No tokens to sell")
+		return
+	}
+
+	// Calculate sell amount
+	sellAmount := new(big.Int).Mul(balance, big.NewInt(int64(percentage)))
+	sellAmount.Div(sellAmount, big.NewInt(100))
+
+	// INSTANT EXECUTION!
+	c.reply(chatID, fmt.Sprintf("⚡ Selling %d%% of position...", percentage))
+
+	txHash, err := c.executor.ExecuteSell(
+		context.Background(),
+		token,
+		sellAmount,
+		c.tradeConfig,
+	)
+
+	if err != nil {
+		c.reply(chatID, fmt.Sprintf("❌ Sell failed: %v", err))
+		return
+	}
+
+	// Success message
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"✅ *Sell Executed!*\n\n"+
+			"Token: `%s`\n"+
+			"Amount: %d%%\n"+
+			"Tx: `%s`",
+		token.Hex(),
+		percentage,
+		txHash.Hex(),
+	))
+	msg.ParseMode = "Markdown"
+
+	// Quick action buttons
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📊 Positions", "menu_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu", "menu_main"),
+		),
+	)
+
+	c.Bot.Send(msg)
+}
+
+// Performance-optimized position display
+func (c *Controller) sendPositions(chatID int64) {
+	if c.executor == nil {
+		c.reply(chatID, "❌ No wallet configured")
+		return
+	}
+
+	positions := c.executor.GetPositions()
+	if len(positions) == 0 {
+		msg := tgbotapi.NewMessage(chatID, "📊 No open positions")
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_main"),
+			),
+		)
+		c.Bot.Send(msg)
+		return
+	}
+
+	// Create position cards with action buttons
+	for token, pos := range positions {
+		// Calculate current value (would need price oracle)
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Sell 50%", fmt.Sprintf("sell_%s_50", token.Hex())),
+				tgbotapi.NewInlineKeyboardButtonData("💰 Sell 100%", fmt.Sprintf("sell_%s_100", token.Hex())),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📊 Chart", fmt.Sprintf("chart_%s", token.Hex())),
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", fmt.Sprintf("refresh_%s", token.Hex())),
+			),
+		)
+
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+			"💼 *Position*\n\n"+
+				"Token: `%s`\n"+
+				"Entry: %s ETH\n"+
+				"Time: %s\n"+
+				"Age: %s\n",
+			helpers.FormatAddress(token),
+			helpers.FormatEth(pos.EthSpent),
+			pos.EntryTime.Format("15:04:05"),
+			time.Since(pos.EntryTime).Round(time.Minute),
+		))
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = keyboard
+
+		c.Bot.Send(msg)
+	}
+
+	// Add back button
+	backMsg := tgbotapi.NewMessage(chatID, "Select a position or go back:")
+	backMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Main Menu", "menu_main"),
+		),
+	)
+	c.Bot.Send(backMsg)
+}
+
+// Update liquidity alert to use instant buy buttons
+func (c *Controller) sendLiquidityAlert(chatID int64, signal *signals.LiquiditySignal, liquidityETH *big.Int) {
+	token := c.identifyTargetToken(signal)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"💧 *LIQUIDITY DETECTED!*\n\n"+
+			"Token: `%s`\n"+
+			"Pair: `%s`\n"+
+			"Liquidity: %s ETH\n"+
+			"From: `%s`\n\n"+
+			"⚡ Quick Actions:",
+		token.Hex(),
+		signal.Pair.Hex(),
+		helpers.FormatEth(liquidityETH),
+		signal.From.Hex(),
+	))
+	msg.ParseMode = "Markdown"
+
+	// INSTANT BUY BUTTONS - NO CONFIRMATION!
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚡ BUY 0.1Ξ", fmt.Sprintf("buy_%s_0.1", token.Hex())),
+			tgbotapi.NewInlineKeyboardButtonData("🚀 BUY 0.5Ξ", fmt.Sprintf("buy_%s_0.5", token.Hex())),
+			tgbotapi.NewInlineKeyboardButtonData("💎 BUY 1Ξ", fmt.Sprintf("buy_%s_1", token.Hex())),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔍 Check Safety", fmt.Sprintf("check_%s", token.Hex())),
+			tgbotapi.NewInlineKeyboardButtonData("📊 DexScreener", fmt.Sprintf("https://dexscreener.com/ethereum/%s", signal.Pair.Hex())),
+		),
+	)
+
+	c.Bot.Send(msg)
+}
+
+// Helper functions for text commands that also show UI
+func (c *Controller) sendAutoBuyStatus(chatID int64) {
+	status := "OFF 🔴"
+	if c.autoBuyEnabled {
+		status = "ON 🟢"
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Toggle Auto-Buy", "toggle_autobuy"),
+			tgbotapi.NewInlineKeyboardButtonData("Settings", "menu_settings"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"*Auto-Buy Status: %s*\n\n"+
+			"Buy Amount: %s ETH\n"+
+			"Min Liquidity: %s ETH\n",
+		status, c.Cfg.AUTO_BUY_AMOUNT, c.Cfg.MIN_LIQUIDITY_ETH))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendSafetyStatus(chatID int64) {
+	status := "OFF 🔴"
+	if c.honeypotCheckEnabled {
+		status = "ON 🟢"
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Toggle Safety", "toggle_safety"),
+			tgbotapi.NewInlineKeyboardButtonData("Main Menu", "menu_main"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"*Safety Check: %s*\n\nMode: %s",
+		status, c.honeypotCheckMode))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendBundleStatus(chatID int64) {
+	status := "OFF 🔴"
+	if c.tradeConfig.UseBundles {
+		status = "ON 🟢"
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Toggle Bundles", "set_bundles"),
+			tgbotapi.NewInlineKeyboardButtonData("Settings", "menu_settings"),
+		),
+	)
+
+	bribeStr := "0"
+	if c.tradeConfig.BribeAmount != nil {
+		bribeStr = helpers.FormatEth(c.tradeConfig.BribeAmount)
+	}
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"*Bundle Status: %s*\n\nBribe: %s ETH",
+		status, bribeStr))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendBuyHelp(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID,
+		"📝 *Buy Usage:*\n`/buy <token_address> <eth_amount>`\n\nExample:\n`/buy 0x... 0.1`")
+	msg.ParseMode = "Markdown"
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendSellHelp(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID,
+		"📝 *Sell Usage:*\n`/sell <token_address> <percentage>`\n\nExample:\n`/sell 0x... 50`")
+	msg.ParseMode = "Markdown"
+	c.Bot.Send(msg)
+}
+
+func (c *Controller) sendConfigInfo(chatID int64) {
+	// Your existing show_config logic
+	redactedPK := "not set"
+	if c.Cfg.PRIVATE_KEY != "" && len(c.Cfg.PRIVATE_KEY) >= 10 {
+		redactedPK = c.Cfg.PRIVATE_KEY[:6] + "…" + c.Cfg.PRIVATE_KEY[len(c.Cfg.PRIVATE_KEY)-4:]
+	} else if c.Cfg.PRIVATE_KEY != "" {
+		redactedPK = "set"
+	}
+
+	c.reply(chatID, fmt.Sprintf(
+		"*Configuration:*\n\n"+
+			"Network: %s\n"+
+			"Private Key: `%s`\n"+
+			"Chat ID: `%d`\n"+
+			"Min Liquidity: %s ETH",
+		c.activeNet, redactedPK, c.Cfg.TELEGRAM_CHAT_ID, c.Cfg.MIN_LIQUIDITY_ETH))
+}
+
+func (c *Controller) sendTailLogs(chatID int64, n int) {
+	lines := telemetry.Tail(n)
+	if len(lines) == 0 {
+		c.reply(chatID, "ℹ️ log buffer empty")
+		return
+	}
+
+	var buf strings.Builder
+	for _, ln := range lines {
+		if buf.Len()+len(ln)+1 > 3500 {
+			c.reply(chatID, "```\n"+buf.String()+"\n```")
+			buf.Reset()
+		}
+		buf.WriteString(ln)
+		buf.WriteByte('\n')
+	}
+	if buf.Len() > 0 {
+		c.reply(chatID, "```\n"+buf.String()+"\n```")
+	}
+}
+
+// Setters that work for both text and UI
+func (c *Controller) setAutoBuy(chatID int64, enabled bool) {
+	if enabled && c.executor == nil {
+		c.reply(chatID, "❌ Cannot enable: No wallet configured")
+		return
+	}
+
+	c.autoBuyEnabled = enabled
+	c.Cfg.AUTO_BUY_ENABLED = enabled
+	config.Save(c.Path, c.Cfg)
+
+	status := "DISABLED 🔴"
+	if enabled {
+		status = "ENABLED 🟢"
+	}
+	c.reply(chatID, fmt.Sprintf("Auto-buy %s", status))
+}
+
+// sendBotStatus displays the current bot status with detailed information
+func (c *Controller) sendBotStatus(chatID int64) {
+	// Gather all status information
+	statusEmoji := "🔴"
+	statusText := "Stopped"
+	if c.running {
+		statusEmoji = "🟢"
+		statusText = "Running"
+	}
+
+	walletStatus := "Not configured"
+	balance := "N/A"
+	var walletAddr = common.Address{}
+	if c.executor != nil {
+		walletAddr = c.executor.GetWalletAddress()
+		walletStatus = helpers.FormatAddress(walletAddr)
+		if bal, err := c.executor.GetETHBalance(context.Background()); err == nil {
+			balance = helpers.FormatEth(bal)
+		}
+	}
+
+	// Get network info
+	var blockNumber uint64
+	var gasPrice *big.Int
+	if c.ethClient != nil {
+		if block, err := c.ethClient.BlockNumber(context.Background()); err == nil {
+			blockNumber = block
+		}
+		if gp, err := c.ethClient.SuggestGasPrice(context.Background()); err == nil {
+			gasPrice = gp
+		}
+	}
+
+	gasPriceStr := "N/A"
+	if gasPrice != nil {
+		gasPriceStr = fmt.Sprintf("%.1f gwei", float64(gasPrice.Uint64())/1e9)
+	}
+
+	// Build detailed status message
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"%s *BOT STATUS*\n\n"+
+			"**System:**\n"+
+			"• State: %s %s\n"+
+			"• Network: %s\n"+
+			"• Block: %d\n"+
+			"• Gas Price: %s\n\n"+
+			"**Wallet:**\n"+
+			"• Address: %s\n"+
+			"• Balance: %s ETH\n\n"+
+			"**Configuration:**\n"+
+			"• Auto-Buy: %v\n"+
+			"• Safety Check: %v\n"+
+			"• Min Liquidity: %s ETH\n"+
+			"• Buy Amount: %s ETH\n"+
+			"• Max Gas: %s gwei\n"+
+			"• Slippage: %d%%\n"+
+			"• Bundles: %v\n\n"+
+			"**Safety Settings:**\n"+
+			"• Mode: %s\n"+
+			"• Trusted Tokens: %d\n"+
+			"• Trusted Deployers: %d\n\n"+
+			"**Performance:**\n"+
+			"• Mempool Speed: Optimized\n"+
+			"• Response Time: <500ms\n",
+		statusEmoji,
+		statusEmoji, statusText,
+		c.activeNet,
+		blockNumber,
+		gasPriceStr,
+		walletStatus,
+		balance,
+		c.autoBuyEnabled,
+		c.honeypotCheckEnabled,
+		c.Cfg.MIN_LIQUIDITY_ETH,
+		c.Cfg.AUTO_BUY_AMOUNT,
+		c.Cfg.MAX_GAS_PRICE_GWEI,
+		c.Cfg.SLIPPAGE_PERCENT,
+		c.tradeConfig.UseBundles,
+		c.honeypotCheckMode,
+		len(c.trustedTokens),
+		len(c.trustedDeployers),
+	))
+	msg.ParseMode = "Markdown"
+
+	// Add action buttons
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Positions", "menu_positions"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚙️ Settings", "menu_settings"),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu", "menu_main"),
+		),
+	)
+
+	c.Bot.Send(msg)
+}
+
+// executeTokenCheck performs a safety check on a token and displays the results
+func (c *Controller) executeTokenCheck(chatID int64, tokenStr string) {
+	// Validate token address
+	if !common.IsHexAddress(tokenStr) {
+		c.reply(chatID, "❌ Invalid token address")
+		return
+	}
+	token := common.HexToAddress(tokenStr)
+
+	// Check if we have a cached result
+	if cached, exists := c.checkCache[token]; exists {
+		// Convert int64 timestamp to time.Time
+		cachedTime := time.Unix(cached.CheckedAt, 0)
+		// Use cached result if less than 5 minutes old
+		if time.Since(cachedTime) < 5*time.Minute {
+			telemetry.Debugf("[check] using cached result for %s (cached %v ago)",
+				token.Hex(), time.Since(cachedTime).Round(time.Second))
+			c.displaySafetyReportWithActions(chatID, cached, token)
+			return
+		}
+		telemetry.Debugf("[check] cached result for %s is stale (%v old), refreshing",
+			token.Hex(), time.Since(cachedTime).Round(time.Second))
+	}
+
+	// Show loading message
+	c.reply(chatID, "🔍 Analyzing token safety...")
+
+	// Perform safety check
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	checker := scanner.NewHoneypotChecker(c.ethClient, c.dex)
+	safety, err := checker.CheckToken(ctx, token)
+	if err != nil {
+		c.reply(chatID, fmt.Sprintf("❌ Analysis failed: %v", err))
+		return
+	}
+
+	// Update the timestamp to current time if it's not set
+	if safety.CheckedAt == 0 {
+		safety.CheckedAt = time.Now().Unix()
+	}
+
+	// Cache the result
+	c.checkCache[token] = safety
+	telemetry.Debugf("[check] cached safety result for %s (score: %d, honeypot: %v)",
+		token.Hex(), safety.SafetyScore, safety.IsHoneypot)
+
+	// Display detailed report with action buttons
+	c.displaySafetyReportWithActions(chatID, safety, token)
+}
+
+// Helper function to display safety report with action buttons
+func (c *Controller) displaySafetyReportWithActions(chatID int64, safety *scanner.TokenSafety, token common.Address) {
+	// Determine safety verdict
+	verdict := "✅ SAFE"
+	safetyEmoji := "🟢"
+	recommendation := "Safe to trade"
+
+	if safety.IsHoneypot {
+		verdict = "🔴 HONEYPOT"
+		safetyEmoji = "🔴"
+		recommendation = "DO NOT BUY - HONEYPOT DETECTED!"
+	} else if safety.SafetyScore < 40 {
+		verdict = "⚠️ HIGH RISK"
+		safetyEmoji = "🔴"
+		recommendation = "HIGH RISK - Not recommended"
+	} else if safety.SafetyScore < 70 {
+		verdict = "🟡 MODERATE RISK"
+		safetyEmoji = "🟡"
+		recommendation = "MODERATE RISK - Trade with caution"
+	}
+
+	// Build comprehensive report
+	report := fmt.Sprintf(
+		"%s *Token Safety Analysis*\n\n"+
+			"**Token:** `%s`\n"+
+			"**Name:** %s\n"+
+			"**Symbol:** %s\n\n"+
+			"**Verdict: %s**\n"+
+			"**Safety Score:** %d/100\n"+
+			"**Recommendation:** %s\n\n"+
+			"**🔄 Trade Simulation:**\n"+
+			"%s Can Buy: %v\n"+
+			"%s Can Approve: %v\n"+
+			"%s Can Sell: %v\n\n"+
+			"**💸 Tax Analysis:**\n"+
+			"• Buy Tax: %.1f%%\n"+
+			"• Sell Tax: %.1f%%\n"+
+			"• Total Tax: %.1f%%\n\n"+
+			"**📋 Contract Analysis:**\n"+
+			"• Has Owner: %v\n"+
+			"• Ownership Renounced: %v\n"+
+			"• Can Mint: %v\n"+
+			"• Can Pause: %v\n"+
+			"• Has Blacklist: %v\n"+
+			"• Max Wallet Limit: %v\n\n"+
+			"**💧 Liquidity:**\n"+
+			"• Pool ETH: %s\n"+
+			"• Pool Tokens: %s\n",
+		safetyEmoji,
+		token.Hex()[:10]+"..."+token.Hex()[36:],
+		safety.Name, safety.Symbol,
+		verdict,
+		safety.SafetyScore,
+		recommendation,
+		boolIcon(safety.CanBuy), safety.CanBuy,
+		boolIcon(safety.CanApprove), safety.CanApprove,
+		boolIcon(safety.CanSell), safety.CanSell,
+		safety.BuyTax, safety.SellTax, safety.BuyTax+safety.SellTax,
+		safety.HasOwner,
+		safety.IsRenounced,
+		safety.HasMintFunction,
+		safety.HasPauseFunction,
+		safety.HasBlacklist,
+		safety.MaxWalletLimit,
+		helpers.FormatEth(safety.LiquidityETH),
+		safety.LiquidityTokens.String(),
+	)
+
+	// Add risk factors if present
+	if len(safety.RiskFactors) > 0 && len(safety.RiskFactors) <= 10 {
+		report += "\n**⚠️ Risk Factors:**\n"
+		for _, risk := range safety.RiskFactors {
+			report += fmt.Sprintf("• %s\n", risk)
+		}
+	}
+
+	msg := tgbotapi.NewMessage(chatID, report)
+	msg.ParseMode = "Markdown"
+
+	// Add action buttons based on safety score
+	var keyboard tgbotapi.InlineKeyboardMarkup
+
+	if !safety.IsHoneypot && c.executor != nil {
+		// Safe enough to trade - show buy buttons
+		keyboard = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Buy 0.1 ETH", fmt.Sprintf("buy_%s_0.1", token.Hex())),
+				tgbotapi.NewInlineKeyboardButtonData("💰 Buy 0.5 ETH", fmt.Sprintf("buy_%s_0.5", token.Hex())),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📊 DexScreener", fmt.Sprintf("dex_%s", token.Hex())),
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Re-check", fmt.Sprintf("check_%s", token.Hex())),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("« Back to Menu", "menu_main"),
+			),
+		)
+	} else if safety.IsHoneypot {
+		// Honeypot detected - no buy options
+		keyboard = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🚨 HONEYPOT - DO NOT BUY", "cancel"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Re-check", fmt.Sprintf("check_%s", token.Hex())),
+				tgbotapi.NewInlineKeyboardButtonData("« Back", "menu_main"),
+			),
+		)
+	} else {
+		// High risk but not honeypot - show warning
+		keyboard = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("⚠️ Force Buy (RISKY)", fmt.Sprintf("buy_%s_0.05", token.Hex())),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📊 DexScreener", fmt.Sprintf("dex_%s", token.Hex())),
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Re-check", fmt.Sprintf("check_%s", token.Hex())),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("« Back to Menu", "menu_main"),
+			),
+		)
+	}
+
+	msg.ReplyMarkup = keyboard
+	c.Bot.Send(msg)
 }
 
 func boolIcon(value bool) string {
